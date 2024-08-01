@@ -7,9 +7,22 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const XLSX = require('xlsx');
 const nodemailer = require('nodemailer');
+const debug = require('debug')('lighting-map');
+const debugMail = require('debug')('lighting-map:mail');
+const debugDB = require('debug')('lighting-map:DB');
 
 const app = express();
+const axios = require('axios');
+
 app.use(bodyParser.json({limit: "50mb"}));
+
+const RateLimit = require("express-rate-limit");
+const limiter = RateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: 50,
+});
+
+app.use(limiter);
 
 const users = require('./schemas/users')
 const reports = require('./schemas/reports')
@@ -18,6 +31,7 @@ const light_points = require('./schemas/lightPoints')
 const townHalls = require('./schemas/townHalls');
 const lightPoints = require('./schemas/lightPoints');
 const emailLighting = 'sicurezza@torellistudio.com'
+
 
 app.use(cors({
     origin: ['http://127.0.0.1:5500', 'http://localhost:8080', 'http://localhost:2000', 'http://localhost:5173'],
@@ -32,7 +46,15 @@ app.use(cors({
 mongoose.connect(`mongodb+srv://torelliStudio:${process.env.PASSWORD_DB}@lightingmap.vlfo8t5.mongodb.net/LightingMap?retryWrites=true&w=majority&appName=LightingMap`)
 
 
-
+app.get('/maps', async (req, res) => {
+    try {
+      const response = await axios.get(`https://maps.googleapis.com/maps/api/js?key=${process.env.GOOGLE_MAPS_APY_KEY}&callback=initMap`);
+      res.send(response.data);
+    } catch (error) {
+        debug(error)
+      res.status(500).send('Errore nella richiesta alla Google Maps API');
+    }
+  });
 
 var transporter = nodemailer.createTransport({
 host: 'smtps.aruba.it',
@@ -79,10 +101,10 @@ app.post('/send-email-to-user/isApproved', async(req, res) => {
       };
       try {
         let info = await transporter.sendMail(mailOptions);
-        console.log('Email sent: ' + info.response);
+        debugMail('Email sent: ' + info.response);
         res.status(200).send('Email inviata con successo');
       } catch (error) {
-        console.log(error);
+        debugMail(error);
         res.status(400).send('Errore durante l\'invio della mail');
       }
     });
@@ -105,10 +127,10 @@ app.post('/send-email-to-user/userNeedValidation', async(req, res) => {
         };
         try {
         let info = await transporter.sendMail(mailOptions);
-        console.log('Email sent: ' + info.response);
+        debugMail('Email sent: ' + info.response);
         res.status(200).send('Email inviata con successo');
         } catch (error) {
-        console.log(error);
+            debugMail(error);
         res.status(400).send('Errore durante l\'invio della mail');
         }
     });
@@ -121,7 +143,7 @@ app.post('/send-email-to-user/lightPointReported', async(req, res) => {
         user_type: { $in: ['ADMINISTRATOR', 'SUPER_ADMIN']}}).select('email -_id')
     const destinationEmail = destination.map(userEmail => userEmail.email)
     
-    console.log(destinationEmail);
+    debugMail(destinationEmail);
 
     const username = req.body.user.name
     const htmlEmail = returnHtmlEmailAfterReport(req.body.user, req.body.date, req.body.name,req.body.light_point ,req.body.report)
@@ -152,9 +174,9 @@ app.post('/send-email-to-user/lightPointReported', async(req, res) => {
         };
         try {
             let info = await transporter.sendMail(mailOptions);
-            console.log(`Email sent to ${email}: ` + info.response);
+            debugMail(`Email sent to ${email}: ` + info.response);
         } catch (error) {
-            console.log(`Error sending email to ${email}: ` + error);
+            debugMail(`Error sending email to ${email}: ` + error);
         }
     }
     res.status(200).send('Emails sent');
@@ -260,7 +282,7 @@ app.post('/users/validateUser', async (req, res) => {
 
         res.send("Utente validato con successo");
     }catch (e){
-        console.log(e)
+        debugDB(e)
         res.status(500).send('Errore del server');
     }
 })
@@ -278,7 +300,7 @@ app.post('/users/removeUser', async (req, res) => {
 
         res.send('Utente eliminato con successo');
     }catch (e){
-        console.log(e);
+        debugDB(e);
         res.status(500).send('errore del server');
     }
 })
@@ -303,7 +325,7 @@ app.post('/users/update/modifyUser', async (req, res) => {
 
         res.send('Utente modificato con successo');
     }catch (e){
-        console.log(e);
+        debugDB(e);
         res.status(500).send('errore del server');
     }
 })
@@ -982,7 +1004,7 @@ async function getAllPuntiLuce(ids) {
 
 
 app.listen(3000, ()=>{
-    console.log("Server is running on port 3000")
+    debug("Server is running on port 3000")
 })
 
 const emailTemplate = require('./emailBodies');
