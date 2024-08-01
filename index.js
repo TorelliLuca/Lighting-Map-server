@@ -136,7 +136,7 @@ app.post('/send-email-to-user/userNeedValidation', async(req, res) => {
     });
 
 app.post('/send-email-to-user/lightPointReported', async(req, res) => {
-    const th = await townHalls.findOne({name: req.body.name});
+    const th = await townHalls.findOne({name: {$eq: req.body.name}});
     if (!th) res.status(404).send('Comune non trovato, impossibile inviare la mail');
 
     const destination = await users.find({town_halls_list: th._id,
@@ -242,7 +242,7 @@ app.post('/users/addPendingUser', async function (req, res) {
     try {
 
         /**controllo che la mail non esista già****/
-        const existingUsr = await users.findOne({email: req.body.email});
+        const existingUsr = await users.findOne({email: {$eq: req.body.email}});
         if (existingUsr) return res.status(400).send('Email già in uso')
         /******/
 
@@ -272,7 +272,7 @@ app.post('/users/validateUser', async (req, res) => {
 
     if (!usrType && !email) return res.status(404).send('Email o tipo non valido');
     try{
-        const usr = await users.findOne({email: email} );
+        const usr = await users.findOne({email: {$eq: email}} );
         if (!usr) return res.status(400).send('user not found');
         
         usr.is_approved = true;
@@ -293,7 +293,7 @@ app.post('/users/removeUser', async (req, res) => {
     if (!email) return res.status(404).send('Email non valida');
 
     try{
-        const usr = await users.findOne({email: email} );
+        const usr = await users.findOne({email: {$eq: email}} );
         if (!usr) return res.status(400).send('user not found');
         
         await usr.deleteOne();
@@ -310,7 +310,7 @@ app.post('/users/update/modifyUser', async (req, res) => {
     if (!email) return res.status(404).send('Email non valida');
 
     try{
-        const usr = await users.findOne({email: email} );
+        const usr = await users.findOne({email:{ $eq: email}} );
         if (!usr) return res.status(400).send('user not found');
         
         usr.name = req.body.name;
@@ -336,13 +336,13 @@ app.post('/users/addTownHalls', async (req, res) => {
       const townHallName = req.body.townHall;
   
       // Cerca il comune nel database
-      const townHall = await townHalls.findOne({ name: townHallName });
+      const townHall = await townHalls.findOne({ name: {$eq: townHallName} });
       if (!townHall) {
         return res.status(404).send('Comune non trovato nel database');
       }
   
       // Trova l'utente e verifica se il comune è già presente nell'array town_halls_list
-      const user = await users.findOne({email: req.body.email});
+      const user = await users.findOne({email: {$eq: req.body.email}});
       if (!user) {
         return res.status(404).send('Utente non trovato');
       }
@@ -366,13 +366,13 @@ app.post('/users/addTownHalls', async (req, res) => {
     try {
       const townHallName = req.body.townHall;
       // Cerca il comune nel database
-      const townHall = await townHalls.findOne({ name: townHallName });
+      const townHall = await townHalls.findOne({ name: {$eq: townHallName} });
       if (!townHall) {
         return res.status(404).send('Comune non trovato nel database');
       }
   
       // Trova l'utente e verifica se il comune è già presente nell'array town_halls_list
-      const user = await users.findOne({email: req.body.email});
+      const user = await users.findOne({email: {$eq: req.body.email}});
       if (!user) {
         return res.status(404).send('Utente non trovato');
       }
@@ -400,7 +400,7 @@ app.post('/login', async function (req, res) {
     }
 
     try {
-        const user = await users.findOne({email: req.body.email}).populate('town_halls_list');
+        const user = await users.findOne({email: {$eq: req.body.email}}).populate('town_halls_list');
         if (!user) {
             return res.status(400).send('Email non valida');
         }
@@ -411,14 +411,8 @@ app.post('/login', async function (req, res) {
             return res.status(400).send('Password non valida');
         }
 
-        //const token = jwt.sign({ id: user.id, user_type: user.user_type }, 'secret_key', { expiresIn: '1h' });
         res.json({ user });
-        // res.cookie('jwtToken', token, {
-        //     httpOnly: true,
-        //     //secure: true, // Usa solo su connessioni HTTPS
-        //     sameSite: 'strict', // Protezione contro attacchi CSRF
-        //     expires: new Date(Date.now() + 3600000) // Imposta una scadenza per il cookie
-        // });
+
     } catch (err) {
         console.error(err);
         res.status(500).send('Errore del server');
@@ -483,7 +477,7 @@ app.delete('/townHalls', async (req, res) => {
         const townHallName = req.body.name;
 
         // Cerca il comune nel database
-        const townHall = await townHalls.findOne({ name: townHallName });
+        const townHall = await townHalls.findOne({ name: {$eq: townHallName} });
         if (!townHall) {
             return res.status(404).send('Comune non trovato nel database');
         }
@@ -509,64 +503,6 @@ app.delete('/townHalls', async (req, res) => {
         res.status(500).send('Errore del server');
     }
 });
-
-
-// endpoint per aggiornare un comune esistente con i suoi punti
-// app.put('/townHalls/updateTownHall', async (req, res) => {
-//     try {
-//         const th = await townHalls.findOne({name: req.params.name});
-//         if (!th) {
-//             return res.status(404).send('Il comune non esiste');
-//         }
-
-//         for (const element of req.body.light_points) {
-
-//             // Trova il punto luce esistente
-//             const lp = await light_points.findById(element._id);
-//             if (!lp) {
-//                 return res.status(404).send('Il punto luce non esiste');
-//             }
-
-//             // Aggiorna le proprietà di lp qui, ad esempio:
-//             lp.marker = element.MARKER;
-//             lp.numero_palo = element.NUMERO_PALO,
-//             lp.composizione_punto= element.COMPOSIZIONE_PUNTO,
-//             lp.indirizzo= element.INDIRIZZO,
-//             lp.lotto= element.LOTTO,
-//             lp.quadro= element.QUADRO,
-//             lp.proprieta= element.PROPRIETA,
-//             lp.tipo_apparecchio= element.TIPO_APPARECCHIO,
-//             lp.modello= element.MODELLO,
-//             lp.numero_apparecchi= element.NUMERO_APPARECCHI,
-//             lp.lampada_potenza= element.LAMPADA_POTENZA,
-//             lp.tipo_sostegno= element.TIPO_SOSTEGNO,
-//             lp.tipo_linea= element.TIPO_LINEA,
-//             lp.promiscuita= element.PROMISCUITA,
-//             lp.note= element.NOTE,
-//             lp.garanzia= element.GARANZIA,
-//             lp.lat= element.LAT,
-//             lp.lng=  element.LNG,
-//             lp.pod = element.POD,
-//             lp.numero_contatore = element.NUMERO_CONTATORE,
-//             lp.alimentazione = element.ALIMENTAZIONE,
-//             lp.potenza_contratto= element.POTENZA_CONTRATTO,
-//             lp.potenza = element.POTENZA,
-//             lp.punti_luce = element.PUNTI_LUCE,
-//             lp.tipo = element.TIPO
-            
-
-//             await lp.save();
-//         }
-
-//         await th.save();
-//         res.status(200).send('Comune e punti luce aggiornati con successo');
-
-//     } catch (err) {
-//         console.error(err);
-//         res.status(500).send('Errore del server');
-//     }
-// });
-
 
 app.get('/townHalls', async (req, res) => {
     try {
@@ -625,7 +561,7 @@ app.get('/townHalls/:name', async (req, res) => {
 app.get('/townHalls/lightpoints/getActiveReports', async (req, res) => {
     try {
         const { name, numero_palo } = req.query;
-        const townHall = await townHalls.findOne({ name })
+        const townHall = await townHalls.findOne({ $eq: name })
             .populate({
                 path: 'punti_luce',
                 match: { numero_palo },
@@ -653,7 +589,7 @@ app.post('/townHalls/update/', async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
     try {
-        let th = await townHalls.findOne({ name: req.body.name }).populate('punti_luce');
+        let th = await townHalls.findOne({ name: {$eq: req.body.name} }).populate('punti_luce');
 
         if (!th) {
             res.status(404).send('comune non trovato');
@@ -753,7 +689,7 @@ app.get('/townHalls/lightpoints/getPoint/', async (req, res) => {
             return res.status(400).send('Nome del comune e numero del palo sono richiesti.');
         }
 
-        const townHall = await townHalls.findOne({ name }).populate({
+        const townHall = await townHalls.findOne({ $eq: name }).populate({
             path: 'punti_luce',
             match: { numero_palo: numero_palo },
         });
@@ -805,7 +741,7 @@ app.post('/townHalls/lightPoints/update/:_id', async (req, res) => {
  */
 app.post('/addReport', async (req, res) => {
     try {
-        const th = await townHalls.findOne({ name: req.body.name });
+        const th = await townHalls.findOne({ name: {$eq: req.body.name} });
 
         if (!th) {
             return res.status(404).send('Comune non trovato');
@@ -842,7 +778,7 @@ app.post('/addReport', async (req, res) => {
         await light_points.updateOne({_id: puntoLuce.id}, {$set: {segnalazioni_in_corso: puntoLuce.segnalazioni_in_corso}});
             
         // Salva le modifiche nel database
-        await townHalls.updateOne({ name: req.body.name }, { $set: { punti_luce: th.punti_luce } });
+        await townHalls.updateOne({ name: {$eq: req.body.name} }, { $set: { punti_luce: th.punti_luce } });
 
         res.send('Segnalazione aggiunta con successo');
 
@@ -860,7 +796,7 @@ app.post('/addReport', async (req, res) => {
 app.post('/addOperation', async (req, res) => {
     try {
 
-        const th = await townHalls.findOne({ name: req.body.name });
+        const th = await townHalls.findOne({ name: {$eq: req.body.name} });
 
         if (!th) {
             return res.status(404).send('Comune non trovato');
@@ -881,7 +817,7 @@ app.post('/addOperation', async (req, res) => {
             return res.status(404).send('Punto luce non trovato');
         }
 
-        const user = await users.findOne({email: req.body.email});
+        const user = await users.findOne({email: {$eq:req.body.email}});
         if (!user) {
             return res.status(404).send('utente non trovato');
         }
@@ -929,7 +865,7 @@ app.post('/addOperation', async (req, res) => {
         await light_points.updateOne({ _id: puntoLuce._id }, { $set: { operazioni_effettuate: puntoLuce.operazioni_effettuate, segnalazioni_in_corso: puntoLuce.segnalazioni_in_corso, segnalazioni_risolte: puntoLuce.segnalazioni_risolte } });
 
         // Salva le modifiche nel database
-        await townHalls.updateOne({ name: req.body.name }, { $set: { punti_luce: th.punti_luce } });
+        await townHalls.updateOne({ name: {$eq: req.body.name} }, { $set: { punti_luce: th.punti_luce } });
         res.send('Operazione aggiunta con successo');
     } catch (error) {
         console.error(error);
