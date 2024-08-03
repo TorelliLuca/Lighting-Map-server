@@ -34,7 +34,7 @@ const emailLighting = 'sicurezza@torellistudio.com'
 
 
 app.use(cors({
-    origin: ['http://127.0.0.1:5500', 'http://localhost:8080', 'http://localhost:2000', 'http://localhost:5173'],
+    origin: ['https://www.torellistudio.com'],
     methods: ['GET', 'POST', 'DELETE'], // Aggiungi qui i metodi che vuoi consentire
     allowedHeaders: ['Content-Type'], // Aggiungi qui le intestazioni che vuoi consentire
     credentials: true
@@ -561,7 +561,7 @@ app.get('/townHalls/:name', async (req, res) => {
 app.get('/townHalls/lightpoints/getActiveReports', async (req, res) => {
     try {
         const { name, numero_palo } = req.query;
-        const townHall = await townHalls.findOne({ $eq: name })
+        const townHall = await townHalls.findOne({ name })
             .populate({
                 path: 'punti_luce',
                 match: { numero_palo },
