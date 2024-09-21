@@ -419,6 +419,32 @@ app.post('/login', async function (req, res) {
     }
 });
 
+app.post('/adminLogin', async function (req, res) {
+    if (!req.body.email || !req.body.password) {
+        return res.status(400).send('Email e Password richiesti');
+    }
+
+    try {
+        const user = await users.findOne({email: {$eq: req.body.email}}).populate('town_halls_list');
+        if (!user) {
+            return res.status(400).send('Email non valida');
+        }
+        if(!user.is_approved) return res.status(400).send('Utente non ancora approvato')
+        const isMatch = await user.comparePassword(req.body.password);
+
+        if (!isMatch) {
+            return res.status(400).send('Password non valida');
+        }
+        if (user.user_type !== 'SUPER_ADMIN') return res.status(400).send('Permessi insufficienti');
+        
+        res.json({ user });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Errore del server');
+    }
+});
+
 
 //endpoint per caricare un nuovo comune con i suoi punti
 app.post('/townHalls', async (req, res) => {
