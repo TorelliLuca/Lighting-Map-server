@@ -43,7 +43,7 @@ app.use(cors({
 
 
 
-mongoose.connect(`mongodb+srv://torelliStudio:${process.env.PASSWORD_DB}@lightingmap.vlfo8t5.mongodb.net/LightingMap?retryWrites=true&w=majority&appName=LightingMap`)
+mongoose.connect(`mongodb+srv://torelliStudio:${process.env.PASSWORD_DB}@lightingmap.vlfo8t5.mongodb.net/${process.env.NAME_DB}?retryWrites=true&w=majority&appName=LightingMap`)
 
 
 app.get('/maps', async (req, res) => {
