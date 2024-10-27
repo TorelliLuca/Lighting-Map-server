@@ -469,7 +469,7 @@ app.post('/townHalls', async (req, res) => {
                 tipo_apparecchio: element.TIPO_APPARECCHIO,
                 modello: element.MODELLO,
                 numero_apparecchi: element.NUMERO_APPARECCHI,
-                lampada_potenza: element.LAMPADA_POTENZA,
+                lampada_potenza: element.LAMPADA_E_POTENZA,
                 tipo_sostegno: element.TIPO_SOSTEGNO,
                 tipo_linea: element.TIPO_LINEA,
                 promiscuita: element.PROMISCUITA,
