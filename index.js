@@ -182,6 +182,53 @@ app.post('/users/addPendingUser', async function (req, res) {
     }
 });
 
+
+
+app.post('/send-email-to-user/userNeedValidation',  async(req, res) => {
+    const username = req.body.user.name
+    const htmlEmail = returnHtmlEmailAdmin(username, req.body.user.surname, req.body.user.date)
+    var mailOptions = {
+        from: `LIGHTING MAP<${emailLighting}>` ,
+        to: process.env.ADMIN_EMAIL,
+        subject: `Richiesta di autenticazione per ${username} ${req.body.user.surname}`,
+        html: htmlEmail,
+        attachments: [
+            {
+                filename: 'image-1.png',
+                path: './email/toAdmin/images/image-1.png', // sostituisci con il percorso reale
+                cid: 'image1' 
+            }
+            ]
+        };
+        try {
+        let info = await transporter.sendMail(mailOptions);
+        debugMail('Email sent: ' + info.response);
+        res.status(200).send('Email inviata con successo');
+        } catch (error) {
+            debugMail(error);
+        res.status(400).send('Errore durante l\'invio della mail');
+        }
+    });
+
+
+// PROTECTED ROUTES (authentication required)
+// ======================================================================================================
+/****
+ * 
+ * 
+ * 
+ * 
+ * 
+ */
+
+app.use(authenticateToken)
+
+
+
+
+
+
+
 // User validation
 app.post('/users/validateUser', async (req, res) => {
     const usrType = req.body.user_type
@@ -530,44 +577,8 @@ app.post('/api/downloadExcelTownHall', function (req, res) {
     res.send(buffer);
 });
 
-app.post('/send-email-to-user/userNeedValidation',  async(req, res) => {
-    const username = req.body.user.name
-    const htmlEmail = returnHtmlEmailAdmin(username, req.body.user.surname, req.body.user.date)
-    var mailOptions = {
-        from: `LIGHTING MAP<${emailLighting}>` ,
-        to: process.env.ADMIN_EMAIL,
-        subject: `Richiesta di autenticazione per ${username} ${req.body.user.surname}`,
-        html: htmlEmail,
-        attachments: [
-            {
-                filename: 'image-1.png',
-                path: './email/toAdmin/images/image-1.png', // sostituisci con il percorso reale
-                cid: 'image1' 
-            }
-            ]
-        };
-        try {
-        let info = await transporter.sendMail(mailOptions);
-        debugMail('Email sent: ' + info.response);
-        res.status(200).send('Email inviata con successo');
-        } catch (error) {
-            debugMail(error);
-        res.status(400).send('Errore durante l\'invio della mail');
-        }
-    });
 
 
-// PROTECTED ROUTES (authentication required)
-// ======================================================================================================
-/****
- * 
- * 
- * 
- * 
- * 
- */
-
-app.use(authenticateToken)
 
 app.get('/maps',  async (req, res) => {
     try {
