@@ -364,42 +364,53 @@ app.post('/users/addTownHalls', async (req, res) => {
             return res.status(400).send('Il comune esiste già');
         }
 
-        const th = await townHalls.create({name: req.body.name});
+        const th = await townHalls.create({
+            name: req.body.name,
+            region: req.body.region,
+            province: req.body.province,
+            coordinates: {
+                lat: req.body.coordinates?.lat,
+                lng: req.body.coordinates?.lng
+            }
+            // created_at and updated_at will be set automatically by default values
+        });
 
-        for (const element of req.body.light_points) {
+        if (req.body.light_points && Array.isArray(req.body.light_points)) {
+            for (const element of req.body.light_points) {
+                const lp = new light_points({
+                    marker: element.MARKER,
+                    numero_palo: element.NUMERO_PALO,
+                    composizione_punto: element.COMPOSIZIONE_PUNTO,
+                    indirizzo: element.INDIRIZZO,
+                    lotto: element.LOTTO,
+                    quadro: element.QUADRO,
+                    proprieta: element.PROPRIETA,
+                    tipo_apparecchio: element.TIPO_APPARECCHIO,
+                    modello: element.MODELLO,
+                    numero_apparecchi: element.NUMERO_APPARECCHI,
+                    lampada_potenza: element.LAMPADA_E_POTENZA,
+                    tipo_sostegno: element.TIPO_SOSTEGNO,
+                    tipo_linea: element.TIPO_LINEA,
+                    promiscuita: element.PROMISCUITA,
+                    note: element.NOTE,
+                    garanzia: element.GARANZIA,
+                    lat: element.lat,
+                    lng: element.lng,
+                    pod: element.POD,
+                    numero_contatore: element.NUMERO_CONTATORE,
+                    alimentazione: element.ALIMENTAZIONE,
+                    potenza_contratto: element.POTENZA_CONTRATTO,
+                    potenza: element.POTENZA,
+                    punti_luce: element.PUNTI_LUCE,
+                    tipo: element.TIPO
+                });
 
-            const lp = new light_points({
-                marker: element.MARKER,
-                numero_palo: element.NUMERO_PALO,
-                composizione_punto: element.COMPOSIZIONE_PUNTO,
-                indirizzo: element.INDIRIZZO,
-                lotto: element.LOTTO,
-                quadro: element.QUADRO,
-                proprieta: element.PROPRIETA,
-                tipo_apparecchio: element.TIPO_APPARECCHIO,
-                modello: element.MODELLO,
-                numero_apparecchi: element.NUMERO_APPARECCHI,
-                lampada_potenza: element.LAMPADA_E_POTENZA,
-                tipo_sostegno: element.TIPO_SOSTEGNO,
-                tipo_linea: element.TIPO_LINEA,
-                promiscuita: element.PROMISCUITA,
-                note: element.NOTE,
-                garanzia: element.GARANZIA,
-                lat: element.lat,
-                lng: element.lng,
-                pod: element.POD,
-                numero_contatore: element.NUMERO_CONTATORE,
-                alimentazione: element.ALIMENTAZIONE,
-                potenza_contratto: element.POTENZA_CONTRATTO,
-                potenza: element.POTENZA,
-                punti_luce: element.PUNTI_LUCE,
-                tipo: element.TIPO
-            });
-
-            await lp.save();
-            th.punti_luce.push(lp);
+                await lp.save();
+                th.punti_luce.push(lp._id);
+            }
+            await th.save();
         }
-        await th.save();
+        
         res.status(200).send('Comune e punti luce creati con successo');
 
     } catch (err) {
@@ -828,8 +839,20 @@ app.get('/profile',  async function (req, res) {
 
 app.get('/townHalls', async (req, res) => {
     try {
-        const thList = await townHalls.find({}).select('-punti_luce');
-        res.json(thList);
+        const thList = await townHalls.find({});
+        
+        const transformedList = thList.map(th => {
+            const thObject = th.toObject(); // Converte il documento Mongoose in un oggetto JavaScript
+            
+            const puntiLuceLength = th.punti_luce ? th.punti_luce.length : 0;
+            
+            delete thObject.punti_luce;
+            thObject.light_points = puntiLuceLength;
+            
+            return thObject;
+        });
+        
+        res.json(transformedList);
     } catch (err) {
         console.error(err);
         res.status(500).send(err);
