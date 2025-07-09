@@ -58,7 +58,7 @@ router.post('/create', async (req, res) => {
     }
 });
 
-router.delete('/delete/:_id', async (req, res) => {
+router.delete('/delete/:_id',  async (req, res) => {
     const _id = req.params._id;
     const lpToDelete = await lightPoints.findOne({_id: _id});
     if(!lpToDelete) {

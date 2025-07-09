@@ -100,7 +100,7 @@ router.post('/send-email-to-user/reportSolved', async(req, res) => {
 
     const destination = await users.find({town_halls_list: th._id,
         user_type: { $in: ['ADMINISTRATOR', 'SUPER_ADMIN']}}).select('email -_id')
-    const destinationEmail = ["TorelliLuca06@gmail.com"]
+    const destinationEmail = destination.map(userEmail => userEmail.email)
     debugMail(destinationEmail);
 
     const username = req.body.user.name

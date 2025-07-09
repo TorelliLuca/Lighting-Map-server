@@ -5,7 +5,8 @@ const light_points = require('../schemas/lightPoints');
 const users = require('../schemas/users');
 const mongoose = require('mongoose');
 const { getAllPuntiLuce } = require('../utils/lightPointHelpers');
-
+const accessLogger = require('../middleware/accessLogger');
+const logAccess = require('../utils/accessLogger');
 const router = express.Router();
 
 router.post('/addOperation', async (req, res) => {
@@ -76,8 +77,29 @@ router.post('/addOperation', async (req, res) => {
         await light_points.updateOne({ _id: puntoLuce._id }, { $set: { operazioni_effettuate: puntoLuce.operazioni_effettuate, segnalazioni_in_corso: puntoLuce.segnalazioni_in_corso, segnalazioni_risolte: puntoLuce.segnalazioni_risolte } });
         await townHalls.updateOne({ name: {$eq: req.body.name} }, { $set: { punti_luce: th.punti_luce } });
         
+        // Log dettagliato
+        await logAccess({
+            user: req.user ? req.user._id : null,
+            action: 'ADD_OPERATION',
+            resource: req.originalUrl,
+            outcome: 'SUCCESS',
+            ipAddress: req.ip,
+            userAgent: req.headers['user-agent'],
+            details: `Operazione creata con id: ${nuovaOperazione._id}`
+        });
+        
         res.send('Operazione aggiunta con successo');
     } catch (error) {
+        // Log errore
+        await logAccess({
+            user: req.user ? req.user._id : null,
+            action: 'ADD_OPERATION',
+            resource: req.originalUrl,
+            outcome: 'FAILURE',
+            ipAddress: req.ip,
+            userAgent: req.headers['user-agent'],
+            details: `Errore: ${error.message}`
+        });
         console.error(error);
         res.status(500).send('Errore del server');
     }

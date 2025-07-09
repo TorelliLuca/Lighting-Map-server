@@ -4,7 +4,8 @@ const jwt = require('jsonwebtoken');
 const users = require('../schemas/users');
 const { transporter, emailLighting, debugMail } = require('../config/email');
 const { returnHtmlEmailAdmin } = require('../utils/emailHelpers');
-
+const accessLogger = require('../middleware/accessLogger');
+const logAccess = require('../utils/accessLogger');
 const router = express.Router();
 
 // Login routes
@@ -38,6 +39,16 @@ router.post('/login', async function (req, res) {
             { expiresIn: process.env.JWT_EXPIRES_IN }
         );
 
+        await logAccess({
+            user: user._id, 
+            action: 'LOGIN',
+            resource: req.originalUrl,
+            outcome: 'SUCCESS',
+            ipAddress: req.ip,
+            userAgent: req.headers['user-agent'],
+            details: null
+        });
+
         // Return user data with token
         res.json({ 
             user: {
@@ -58,7 +69,7 @@ router.post('/login', async function (req, res) {
     }
 });
 
-router.post('/adminLogin', async function (req, res) {
+router.post('/adminLogin', accessLogger('ADMIN_LOGIN'), async function (req, res) {
     if (!req.body.email || !req.body.password) {
         return res.status(400).send('Email e Password richiesti');
     }
@@ -139,20 +150,6 @@ router.post('/send-email-to-user/userNeedValidation', async(req, res) => {
     }
 });
 
-router.post('/refresh-token', (req, res) => {
-    // Create a new token with the same user info
-    const token = jwt.sign(
-        { 
-            id: req.user.id,
-            email: req.user.email,
-            name: req.user.name,
-            surname: req.user.surname
-        }, 
-        process.env.JWT_SECRET,
-        { expiresIn: process.env.JWT_EXPIRES_IN }
-    );
-    
-    res.json({ token });
-});
+
 
 module.exports = router; 

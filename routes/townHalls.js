@@ -7,7 +7,7 @@ const users = require('../schemas/users');
 const XLSX = require('xlsx');
 const { transporter, emailLighting, debugMail } = require('../config/email');
 const { returnHtmlEmailUploadSuccess, returnHtmlEmailUploadError } = require('../utils/emailHelpers');
-const { toCsvItalianStyle } = require('../utils/utility');
+const { toCsvItalianStyle, normalizeKeysToLowerCase, isEmptyLightPoint, compareNumeroPalo } = require('../utils/utility');
 
 const router = express.Router();
 
@@ -244,6 +244,8 @@ function prepareBulkOps(incomingPoints) {
 }
 
 
+
+
 router.post('/update/', async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -258,8 +260,17 @@ router.post('/update/', async (req, res) => {
 
         const existingIds = th.punti_luce.map(id => id.toString());
         // Normalizza i dati se sono in formato tabulato
-        let incomingPoints = req.body.light_points;
+        let incomingPoints = req.body.light_points || [];
+        // Normalizza le chiavi di ogni oggetto punto luce a minuscolo
+        incomingPoints = incomingPoints.map(normalizeKeysToLowerCase);
 
+        // Filtra i punti luce vuoti
+        incomingPoints = incomingPoints.filter(lp => {
+            if (!lp._id && isEmptyLightPoint(lp)) {
+                return false; // Escludi questo punto
+            }
+            return true; // Tieni tutti gli altri
+        });
 
         // Calcola cosa eliminare
         const { toDelete } = diffLightPoints(existingIds, incomingPoints);
@@ -277,7 +288,7 @@ router.post('/update/', async (req, res) => {
 
         // Recupera tutti gli _id aggiornati (inclusi quelli nuovi)
         const updatedLightPoints = await lightPoints.find({
-            marker: { $in: incomingPoints.map(lp => lp.MARKER) }
+            marker: { $in: incomingPoints.map(lp => lp.marker) }
         }).session(session);
 
         th.punti_luce = updatedLightPoints.map(lp => lp._id);
@@ -439,8 +450,15 @@ router.post('/api/downloadExcelTownHall', function (req, res) {
             return res.status(400).send('Dati non validi');
         }
 
+        // Ordina i punti luce per numero_palo (come stringa)
+        const sortedPuntiLuce = [...jsonData.punti_luce].sort((a, b) => {
+            const aVal = a.numero_palo !== undefined && a.numero_palo !== null ? String(a.numero_palo) : '';
+            const bVal = b.numero_palo !== undefined && b.numero_palo !== null ? String(b.numero_palo) : '';
+            return aVal.localeCompare(bVal, 'it', { numeric: false, sensitivity: 'base' });
+        });
+
         // Appiattisci l'oggetto JSON
-        const cleanedJson = jsonData.punti_luce
+        const cleanedJson = sortedPuntiLuce
             .map(lp => ({ ...lp, name: jsonData.name }))
             .map(({ segnalazioni_in_corso, segnalazioni_risolte, operazioni_effettuate, name, __v, ...item }) => item)
             .map(item => Object.fromEntries(Object.entries(item).map(([key, value]) => key === '_id' ? [key, value] : [key.toUpperCase(), value])));
@@ -465,8 +483,10 @@ router.post('/api/downloadExcelTownHall', function (req, res) {
 
 router.post('/api/downloadCsvTownHall', function (req, res) {
     const jsonData = req.body;
+    // Ordina i punti luce per numero_palo (come stringa)
+    const sortedPuntiLuce = [...jsonData.punti_luce].sort(compareNumeroPalo);
     // Appiattisci l'oggetto JSON come per l'XLSX
-    const cleanedJson = jsonData.punti_luce
+    const cleanedJson = sortedPuntiLuce
         .map(lp => ({ ...lp, name: jsonData.name }))
         .map(({ segnalazioni_in_corso, segnalazioni_risolte, operazioni_effettuate, name, __v, ...item }) => item)
         .map(item => Object.fromEntries(Object.entries(item).map(([key, value]) => key === '_id' ? [key, value] : [key.toUpperCase(), value])));

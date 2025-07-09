@@ -24,6 +24,8 @@ const reportRoutes = require('./routes/reports');
 const operationRoutes = require('./routes/operations');
 const emailRoutes = require('./routes/email');
 const mapsRoutes = require('./routes/maps');
+const accessLogsRoutes = require('./routes/accessLogs');
+const maintenanceRoutes = require('./routes/maintenance');
 
 const app = express();
 
@@ -48,7 +50,6 @@ const corsOptions = {
     allowedHeaders: ['Authorization','Content-Type'], 
     credentials: false
 };
-console.log(corsOptions)
 app.options('*', cors(corsOptions));
 app.use(cors(corsOptions));
 
@@ -60,6 +61,9 @@ connectDB();
 
 // Auth routes (login, registration, etc.)
 app.use('/', authRoutes);
+// Maintenance routes (cron job for cleaning up the database) 
+// NOTE: protected by basic auth not jwt
+app.use('/api/maintenance', maintenanceRoutes);
 
 // PROTECTED ROUTES (authentication required)
 // =========================================
@@ -86,6 +90,12 @@ app.use('/', emailRoutes);
 
 // Maps routes
 app.use('/maps', mapsRoutes);
+
+// Access logs routes
+app.use('/api/access-logs', accessLogsRoutes);
+
+
+
 
 // Start server
 const PORT = process.env.PORT || 3000;

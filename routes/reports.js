@@ -4,7 +4,8 @@ const townHalls = require('../schemas/townHalls');
 const reports = require('../schemas/reports');
 const light_points = require('../schemas/lightPoints');
 const { getAllPuntiLuce } = require('../utils/lightPointHelpers');
-
+const accessLogger = require('../middleware/accessLogger');
+const logAccess = require('../utils/accessLogger');
 const router = express.Router();
 
 router.post('/addReport', async (req, res) => {
@@ -42,9 +43,30 @@ router.post('/addReport', async (req, res) => {
         await light_points.updateOne({_id: puntoLuce.id}, {$set: {segnalazioni_in_corso: puntoLuce.segnalazioni_in_corso}});
         await townHalls.updateOne({ name: {$eq: req.body.name} }, { $set: { punti_luce: th.punti_luce } });
 
+        // Log dettagliato
+        await logAccess({
+            user: req.user ? req.user._id : null,
+            action: 'ADD_REPORT',
+            resource: req.originalUrl,
+            outcome: 'SUCCESS',
+            ipAddress: req.ip,
+            userAgent: req.headers['user-agent'],
+            details: `Report creato con id: ${nuovaSegnalazione._id}`
+        });
+
         res.send('Segnalazione aggiunta con successo');
 
     } catch (error) {
+        // Log errore
+        await logAccess({
+            user: req.user ? req.user._id : null,
+            action: 'ADD_REPORT',
+            resource: req.originalUrl,
+            outcome: 'FAILURE',
+            ipAddress: req.ip,
+            userAgent: req.headers['user-agent'],
+            details: `Errore: ${error.message}`
+        });
         console.error(error);
         res.status(500).send('Errore del server');
     }

@@ -34,6 +34,15 @@ const schema = new Schema({
 //per esportare il modello
 module.exports = model("lightPoints", schema)
 
+schema.post('findOneAndDelete', async function(doc) {
+    if (doc) {
+      await require('./townHalls').updateMany(
+        { punti_luce: doc._id },
+        { $pull: { punti_luce: doc._id } }
+      );
+    }
+  });
+
 /*
 Punto luce spento
 Impianto spento

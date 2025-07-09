@@ -4,8 +4,9 @@ const townHalls = require('../schemas/townHalls');
 const debugDB = require('debug')('lighting-map:DB');
 const { toCsvItalianStyle } = require('../utils/utility');
 const { parse } = require('json2csv');
-
+const accessLogger = require('../middleware/accessLogger');
 const router = express.Router();
+const jwt = require('jsonwebtoken');
 
 // User validation
 router.post('/validateUser', async (req, res) => {
@@ -183,11 +184,10 @@ router.get('/getForEmail/:email', async function (req, res) {
     }
 });
 
-router.get('/profile', async function (req, res) {
+router.get('/profile', accessLogger('GET_PROFILE'), async function (req, res) {
     try {
       const userId = req.user.id;
       
-      // Find the user in the database
       const user = await users.findOne({ id: userId });
       
       if (user) {
@@ -232,6 +232,47 @@ router.get('/api/downloadCsv', async function (req, res) {
     } catch (err) {
         console.error(err);
         res.status(500).send(err);
+    }
+});
+
+router.post('/refresh-token', (req, res) => {
+    // Create a new token with the same user info
+    const token = jwt.sign(
+        { 
+            id: req.user.id,
+            email: req.user.email,
+            name: req.user.name,
+            surname: req.user.surname
+        }, 
+        process.env.JWT_SECRET,
+        { expiresIn: process.env.JWT_EXPIRES_IN }
+    );
+    
+    res.json({ token });
+});
+
+// Endpoint per ottenere la somma totale dei punti luce dei comuni associati a un utente
+router.get('/:id/lightPointsCount', async function (req, res) {
+    try {
+        const user = await users.findById(req.params.id).populate('town_halls_list');
+        if (!user) {
+            return res.status(404).send('Utente non trovato');
+        }
+        // Calcola la somma dei punti luce di tutti i comuni associati
+        let totalLightPoints = 0;
+        const townhalls = [];
+        for (const townHall of user.town_halls_list) {
+            if (townHall.punti_luce && Array.isArray(townHall.punti_luce)) {
+                totalLightPoints += townHall.punti_luce.length;
+            }
+            if (townHall.name) {
+                townhalls.push(townHall.name);
+            }
+        }
+        res.json({ totalLightPoints, townhalls });
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Errore del server');
     }
 });
 
