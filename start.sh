@@ -1,2 +1,2 @@
 #!/bin/bash
-node index.js
+set NODE_ENV=development && node index.js

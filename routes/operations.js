@@ -7,7 +7,8 @@ const mongoose = require('mongoose');
 const { getAllPuntiLuce } = require('../utils/lightPointHelpers');
 const accessLogger = require('../middleware/accessLogger');
 const logAccess = require('../utils/accessLogger');
-const router = express.Router();
+const reports = require('../schemas/reports');
+const router = express.Router();    
 
 router.post('/addOperation', async (req, res) => {
     try {
@@ -102,6 +103,57 @@ router.post('/addOperation', async (req, res) => {
         });
         console.error(error);
         res.status(500).send('Errore del server');
+    }
+});
+
+router.get('/api/avg-time-report-operation/:comune', async (req, res) => {
+    try {
+        const comune = req.params.comune;
+        if (!comune) return res.status(400).json({ error: 'Comune mancante' });
+
+        // 1. Trova il comune
+        const th = await townHalls.findOne({ name: { $eq: comune } });
+        if (!th) return res.status(404).json({ error: 'Comune non trovato' });
+
+        // 2. Trova tutti i punti luce del comune
+        const ids = th.punti_luce;
+        if (!ids || ids.length === 0) return res.status(404).json({ error: 'Nessun punto luce trovato per questo comune' });
+        const puntiLuce = await getAllPuntiLuce(ids);
+
+        let totalDiff = 0;
+        let count = 0;
+
+        for (const punto of puntiLuce) {
+            if (!punto) continue;
+            // Unisco segnalazioni in corso e risolte (se esistono)
+
+
+            for (const segnalazione of punto.segnalazioni_risolte) {
+                if (!segnalazione || !segnalazione._id) continue;
+                // Trova l'operazione risolutiva più vicina (is_solved: true, report_to_solve = id segnalazione)
+                const report = await reports.findOne({_id: segnalazione._id});
+                const operazione = await operations.findOne({
+                    report_to_solve: report._id,
+                    is_solved: true,
+                    operation_date: { $gte: report.report_date }
+                }).sort({ operation_date: 1 });
+                console.log(operazione);
+
+                if (operazione) {
+                    const diff = new Date(operazione.operation_date) - new Date(report.report_date);
+                    totalDiff += diff;
+                    count++;
+                }
+            }
+        }
+
+        if (count === 0) return res.json({ avgTimeMs: null, message: 'Nessuna operazione risolutiva trovata' });
+
+        const avgTimeMs = totalDiff / count;
+        res.json({ avgTimeMs, avgTimeHours: avgTimeMs / (1000 * 60 * 60), count });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Errore interno' });
     }
 });
 

@@ -53,6 +53,8 @@ router.post('/', async (req, res) => {
 
         let puntiLuceIds = [];
         const BATCH_SIZE = 300;
+
+        console.log(req.body.light_points.slice(0, 10));
         if (req.body.light_points && Array.isArray(req.body.light_points) && req.body.light_points.length > 0) {
             const lightPointsData = req.body.light_points.map(element => ({
                 marker: element.MARKER,
@@ -81,6 +83,7 @@ router.post('/', async (req, res) => {
                 punti_luce: element.PUNTI_LUCE,
                 tipo: element.TIPO
             }));
+            console.log(lightPointsData.slice(0, 10));
 
             const batches = chunkArray(lightPointsData, BATCH_SIZE);
             for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {

@@ -100,8 +100,7 @@ router.post('/addPendingUser', async function (req, res) {
     if (!req.body.name || !req.body.surname || !req.body.email || !req.body.password) {
         return res.status(400).send('id, name, surname, email, and password are required');
     }
-    console.log("Entrato nell'addPendingUser")
-    console.log(req.body)
+
 
     try {
         const existingUsr = await users.findOne({email: {$eq: req.body.email}});
