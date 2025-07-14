@@ -261,7 +261,13 @@ function returnHtmlEmailUpdateSuccessSummary(nomeComune, eliminati, modificati, 
 
 // Funzione di normalizzazione robusta per i dati dei punti luce
 function normalizeLightPointData(lp) {
-    // Lista dei campi previsti dallo schema
+    // Porta tutte le chiavi a minuscolo
+    const lowerCaseLp = {};
+    Object.keys(lp).forEach(key => {
+        lowerCaseLp[key.toLowerCase()] = lp[key];
+    });
+
+    // Lista dei campi previsti dallo schema (tutti minuscoli)
     const allowedFields = [
         'marker', 'numero_palo', 'composizione_punto', 'indirizzo', 'lotto', 'quadro', 'proprieta',
         'tipo_apparecchio', 'modello', 'numero_apparecchi', 'lampada_potenza', 'tipo_sostegno',
@@ -270,13 +276,15 @@ function normalizeLightPointData(lp) {
         '_id', // per update
         'segnalazioni_in_corso', 'segnalazioni_risolte', 'operazioni_effettuate'
     ];
+
     const normalized = {};
     for (const key of allowedFields) {
-        if (lp.hasOwnProperty(key)) {
-            normalized[key] = lp[key];
+        if (lowerCaseLp.hasOwnProperty(key)) {
+            normalized[key] = lowerCaseLp[key];
         }
     }
     return normalized;
+
 }
 
 
