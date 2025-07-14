@@ -259,6 +259,26 @@ function returnHtmlEmailUpdateSuccessSummary(nomeComune, eliminati, modificati, 
     `;
 }
 
+// Funzione di normalizzazione robusta per i dati dei punti luce
+function normalizeLightPointData(lp) {
+    // Lista dei campi previsti dallo schema
+    const allowedFields = [
+        'marker', 'numero_palo', 'composizione_punto', 'indirizzo', 'lotto', 'quadro', 'proprieta',
+        'tipo_apparecchio', 'modello', 'numero_apparecchi', 'lampada_potenza', 'tipo_sostegno',
+        'tipo_linea', 'promiscuita', 'note', 'garanzia', 'lat', 'lng', 'pod', 'numero_contatore',
+        'alimentazione', 'potenza_contratto', 'potenza', 'punti_luce', 'tipo',
+        '_id', // per update
+        'segnalazioni_in_corso', 'segnalazioni_risolte', 'operazioni_effettuate'
+    ];
+    const normalized = {};
+    for (const key of allowedFields) {
+        if (lp.hasOwnProperty(key)) {
+            normalized[key] = lp[key];
+        }
+    }
+    return normalized;
+}
+
 
 router.post('/update/', async (req, res) => {
     const session = await mongoose.startSession();
@@ -276,11 +296,12 @@ router.post('/update/', async (req, res) => {
     let eliminatiFull = [];
     let modificatiFull = [];
     let aggiuntiFull = [];
+    // Costante per batch size
+    const BATCH_SIZE = 100;
     try {
-        // Recupera solo gli _id dei punti luce
+        // 1. Recupera il comune
         let th = await townHalls.findOne({ name: req.body.name }).session(session);
         if (!th) {
-
             await session.abortTransaction();
             session.endSession();
             responseStatus = 404;
@@ -304,104 +325,112 @@ router.post('/update/', async (req, res) => {
             return;
         }
 
+        // 2. Recupera solo gli ID dei punti luce esistenti
         const existingIds = th.punti_luce.map(id => id.toString());
-        // Normalizza i dati se sono in formato tabulato
+        // 3. Normalizza e valida i dati in ingresso
         let incomingPoints = req.body.light_points || [];
-        // Normalizza le chiavi di ogni oggetto punto luce a minuscolo
-        incomingPoints = incomingPoints.map(normalizeKeysToLowerCase);
-        // Filtra i punti luce vuoti
+        incomingPoints = incomingPoints.map(normalizeLightPointData);
+        // Filtra i punti luce vuoti (usando la funzione già esistente)
         incomingPoints = incomingPoints.filter(lp => {
             if (!lp._id && isEmptyLightPoint(lp)) {
-                return false; // Escludi questo punto
+                return false;
             }
-            return true; // Tieni tutti gli altri
+            return true;
         });
-        // Calcola cosa eliminare
+        // 4. Calcola cosa eliminare
         const { toDelete } = diffLightPoints(existingIds, incomingPoints);
         eliminati = [...toDelete];
-        // Recupera i dati completi dei punti luce eliminati prima di cancellarli
+        // Recupera i dati completi dei punti luce eliminati prima di cancellarli (in batch)
         if (eliminati.length > 0) {
-            eliminatiFull = await lightPoints.find({ _id: { $in: eliminati } }).lean().session(session);
+            for (let i = 0; i < eliminati.length; i += BATCH_SIZE) {
+                const batchIds = eliminati.slice(i, i + BATCH_SIZE);
+                const batchData = await lightPoints.find({ _id: { $in: batchIds } }).lean().session(session);
+                eliminatiFull = eliminatiFull.concat(batchData);
+            }
         }
-        
-        
-        // Calcola modificati e aggiunti
+        // 5. Calcola modificati e aggiunti
         modificati = incomingPoints.filter(lp => lp._id && existingIds.includes(lp._id.toString())).map(lp => lp._id);
         aggiunti = incomingPoints.filter(lp => !lp._id);
 
-        // Elimina in bulk
+        // 6. Elimina in batch
         if (toDelete.length > 0) {
-            await lightPoints.deleteMany({ _id: { $in: toDelete } }).session(session);
-        }
-
-        // Aggiorna/inserisci in bulk
-        const bulkOps = prepareBulkOps(incomingPoints);
-        if (bulkOps.length > 0) {
-            try {
-                await lightPoints.bulkWrite(bulkOps, { session });
-            } catch (bulkErr) {
-                // Errore durante bulkWrite
-                await session.abortTransaction();
-                session.endSession();
-                responseStatus = 500;
-                responseMessage = `Errore durante l'aggiornamento dei punti luce: ${bulkErr && bulkErr.message ? bulkErr.message : bulkErr.toString()}`;
-                mailSubject = 'Errore durante aggiornamento punti luce';
-                // Serializza solo il primo oggetto che ha causato errore (se disponibile)
-                const erroreOggetto = incomingPoints && incomingPoints.length > 0 ? incomingPoints[0] : null;
-                const oggettoString = erroreOggetto ? `<pre>${JSON.stringify(erroreOggetto, null, 2)}</pre>` : '<i>Nessun oggetto disponibile</i>';
-                const errorMsg = `<b>Errore:</b> ${bulkErr && bulkErr.message ? bulkErr.message : bulkErr.toString()}`;
-                mailHtml = `
-                    <h3>Errore durante l'aggiornamento dei punti luce</h3>
-                    <p><b>Oggetto che ha causato l'errore:</b></p>
-                    ${oggettoString}
-                    <p>${errorMsg}</p>
-                `;
-                res.status(responseStatus).send(responseMessage);
-                // Invio email dopo la risposta
-                try {
-                    const adminEmails = req.body.userEmail;
-                    const mailOptions = {
-                        from: `LIGHTING MAP<${emailLighting}>`,
-                        to: adminEmails,
-                        subject: mailSubject,
-                        html: mailHtml
-                    };
-                    await transporter.sendMail(mailOptions);
-                    debugMail(bulkErr);
-                } catch (e) {
-                    debugMail('Errore nell\'invio email:', e);
-                }
-                return;
+            for (let i = 0; i < toDelete.length; i += BATCH_SIZE) {
+                const batchIds = toDelete.slice(i, i + BATCH_SIZE);
+                await lightPoints.deleteMany({ _id: { $in: batchIds } }).session(session);
             }
         }
-
-        // Recupera tutti gli _id aggiornati (inclusi quelli nuovi) usando batch per evitare OOM
-        const uniqueMarkers = [...new Set(incomingPoints.map(lp => lp.marker))];
-        const BATCH_SIZE_UPDATE = 300;
+        // 7. Aggiorna/inserisci in batch
+        const bulkOps = prepareBulkOps(incomingPoints);
+        // Array per raccogliere i nuovi _id inseriti
+        let insertedIds = [];
+        if (bulkOps.length > 0) {
+            for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
+                const batchOps = bulkOps.slice(i, i + BATCH_SIZE);
+                try {
+                    const result = await lightPoints.bulkWrite(batchOps, { session });
+                    // Estrai i nuovi _id dagli insertOne
+                    if (result && result.insertedIds) {
+                        Object.values(result.insertedIds).forEach(id => insertedIds.push(id));
+                    }
+                } catch (bulkErr) {
+                    await session.abortTransaction();
+                    session.endSession();
+                    responseStatus = 500;
+                    responseMessage = `Errore durante l'aggiornamento dei punti luce: ${bulkErr && bulkErr.message ? bulkErr.message : bulkErr.toString()}`;
+                    mailSubject = 'Errore durante aggiornamento punti luce';
+                    const erroreOggetto = batchOps[0] ? JSON.stringify(batchOps[0], null, 2) : '<i>Nessun oggetto disponibile</i>';
+                    const errorMsg = `<b>Errore:</b> ${bulkErr && bulkErr.message ? bulkErr.message : bulkErr.toString()}`;
+                    mailHtml = `
+                        <h3>Errore durante l'aggiornamento dei punti luce</h3>
+                        <p><b>Oggetto che ha causato l'errore:</b></p>
+                        <pre>${erroreOggetto}</pre>
+                        <p>${errorMsg}</p>
+                    `;
+                    res.status(responseStatus).send(responseMessage);
+                    try {
+                        const adminEmails = req.body.userEmail;
+                        const mailOptions = {
+                            from: `LIGHTING MAP<${emailLighting}>`,
+                            to: adminEmails,
+                            subject: mailSubject,
+                            html: mailHtml
+                        };
+                        await transporter.sendMail(mailOptions);
+                        debugMail(bulkErr);
+                    } catch (e) {
+                        debugMail('Errore nell\'invio email:', e);
+                    }
+                    return;
+                }
+            }
+        }
+        // 8. Recupera tutti gli _id aggiornati (inclusi quelli nuovi) in batch
         let updatedLightPoints = [];
-
-        const markerBatches = chunkArray(uniqueMarkers, BATCH_SIZE_UPDATE);
-        for (const batch of markerBatches) {
-            const batchResults = await lightPoints.find({ marker: { $in: batch } }).session(session);
-            updatedLightPoints = updatedLightPoints.concat(batchResults);
-        }
-        th.punti_luce = updatedLightPoints.map(lp => lp._id);
-        await th.save({ session });
-
-        // Recupera i dati completi dei modificati e aggiunti
+        // Per i modificati
         if (modificati.length > 0) {
-            modificatiFull = await lightPoints.find({ _id: { $in: modificati } }).lean().session(session);
+            for (let i = 0; i < modificati.length; i += BATCH_SIZE) {
+                const batchIds = modificati.slice(i, i + BATCH_SIZE);
+                const batchData = await lightPoints.find({ _id: { $in: batchIds } }).lean().session(session);
+                modificatiFull = modificatiFull.concat(batchData);
+                updatedLightPoints = updatedLightPoints.concat(batchData.map(lp => lp._id));
+            }
         }
-        if (aggiunti.length > 0) {
-            // Dopo la bulkWrite, i nuovi punti luce sono quelli con marker corrispondente e _id presente
-            const markersAggiunti = aggiunti.map(lp => lp.marker);
-            aggiuntiFull = await lightPoints.find({ marker: { $in: markersAggiunti } }).lean().session(session);
+        // Per gli aggiunti: ora abbiamo gli _id direttamente
+        if (insertedIds.length > 0) {
+            for (let i = 0; i < insertedIds.length; i += BATCH_SIZE) {
+                const batchIds = insertedIds.slice(i, i + BATCH_SIZE);
+                const batchData = await lightPoints.find({ _id: { $in: batchIds } }).lean().session(session);
+                aggiuntiFull = aggiuntiFull.concat(batchData);
+                updatedLightPoints = updatedLightPoints.concat(batchData.map(lp => lp._id));
+            }
         }
-
+        // 9. Aggiorna la lista punti_luce del comune (solo ID unici)
+        th.punti_luce = Array.from(new Set(updatedLightPoints));
+        await th.save({ session });
         await session.commitTransaction();
         session.endSession();
-
-        // Genera file Excel con 3 fogli
+        console.log("arrivato alla fine delle operazioni, tutto ok")
+        // 10. Genera file Excel con 3 fogli
         const XLSX = require('xlsx');
         const workbook = XLSX.utils.book_new();
         if (eliminatiFull.length > 0) {
