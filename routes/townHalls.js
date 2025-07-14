@@ -66,7 +66,7 @@ router.post('/', async (req, res) => {
                 quadro: element.QUADRO,
                 proprieta: element.PROPRIETA,
                 tipo_apparecchio: element.TIPO_APPARECCHIO,
-                modello: element.MODELLO,
+                modello: element.MODELLO_ARMATURA,
                 numero_apparecchi: element.NUMERO_APPARECCHI,
                 lampada_potenza: element.LAMPADA_E_POTENZA,
                 tipo_sostegno: element.TIPO_SOSTEGNO,
@@ -267,6 +267,13 @@ function normalizeLightPointData(lp) {
         lowerCaseLp[key.toLowerCase()] = lp[key];
     });
 
+    // Mappa di conversione CSV → DB
+    const csvToDbFieldMap = {
+        'lampada_e_potenza': 'lampada_potenza',
+        'modello_armatura': 'modello',
+        // aggiungi qui altre conversioni se necessario
+    };
+
     // Lista dei campi previsti dallo schema (tutti minuscoli)
     const allowedFields = [
         'marker', 'numero_palo', 'composizione_punto', 'indirizzo', 'lotto', 'quadro', 'proprieta',
@@ -279,12 +286,20 @@ function normalizeLightPointData(lp) {
 
     const normalized = {};
     for (const key of allowedFields) {
+        // Se il campo esiste già con il nome giusto
         if (lowerCaseLp.hasOwnProperty(key)) {
             normalized[key] = lowerCaseLp[key];
         }
+        // Se il campo esiste con il nome del CSV, lo mappo
+        else {
+            // Cerco se c'è una chiave CSV che mappa su questo campo DB
+            const csvKey = Object.keys(csvToDbFieldMap).find(csvField => csvToDbFieldMap[csvField] === key);
+            if (csvKey && lowerCaseLp.hasOwnProperty(csvKey)) {
+                normalized[key] = lowerCaseLp[csvKey];
+            }
+        }
     }
     return normalized;
-
 }
 
 
