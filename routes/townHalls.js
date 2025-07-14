@@ -13,6 +13,7 @@ const router = express.Router();
 
 
 router.post('/', async (req, res) => {
+    console.log('create townhalls endpoint');
     const session = await mongoose.startSession();
     session.startTransaction();
     let batchStatus = [];
