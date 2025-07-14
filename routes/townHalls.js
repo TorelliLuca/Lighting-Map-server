@@ -54,7 +54,6 @@ router.post('/', async (req, res) => {
         let puntiLuceIds = [];
         const BATCH_SIZE = 300;
 
-        console.log(req.body.light_points.slice(0, 10));
         if (req.body.light_points && Array.isArray(req.body.light_points) && req.body.light_points.length > 0) {
             const lightPointsData = req.body.light_points.map(element => ({
                 marker: element.MARKER,
@@ -83,7 +82,6 @@ router.post('/', async (req, res) => {
                 punti_luce: element.PUNTI_LUCE,
                 tipo: element.TIPO
             }));
-            console.log(lightPointsData.slice(0, 10));
 
             const batches = chunkArray(lightPointsData, BATCH_SIZE);
             for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
@@ -246,19 +244,61 @@ function prepareBulkOps(incomingPoints) {
     });
 }
 
-
+// Funzione per generare l'HTML della mail di successo con riepilogo quantità
+function returnHtmlEmailUpdateSuccessSummary(nomeComune, eliminati, modificati, aggiunti) {
+    return `
+        <h2>Aggiornamento punti luce per il comune di <b>${nomeComune}</b> completato con successo!</h2>
+        <ul>
+            <li><b>Eliminati</b>: ${eliminati.length}</li>
+            <li><b>Modificati</b>: ${modificati.length}</li>
+            <li><b>Aggiunti</b>: ${aggiunti.length}</li>
+        </ul>
+        <p>In allegato trovi il file Excel con il dettaglio completo.</p>
+    `;
+}
 
 
 router.post('/update/', async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
+    let responseStatus = 200;
+    let responseMessage = 'Comune e punti luce aggiornati con successo';
+    let mailSubject = 'Aggiornamento completato';
+    let mailHtml = null;
+    let isError = false;
+    // Variabili per la mail dettagliata
+    let eliminati = [];
+    let modificati = [];
+    let aggiunti = [];
+    // Variabili per i dati completi da inserire nel file Excel
+    let eliminatiFull = [];
+    let modificatiFull = [];
+    let aggiuntiFull = [];
     try {
         // Recupera solo gli _id dei punti luce
         let th = await townHalls.findOne({ name: req.body.name }).session(session);
         if (!th) {
             await session.abortTransaction();
             session.endSession();
-            return res.status(404).send('Comune non trovato');
+            responseStatus = 404;
+            responseMessage = 'Comune non trovato';
+            mailSubject = 'Errore durante aggiornamento';
+            mailHtml = returnHtmlEmailUploadError(req.body.name, responseMessage);
+            res.status(responseStatus).send(responseMessage);
+            // Invio email dopo la risposta
+            try {
+                const adminEmails = req.body.userEmail;
+                const mailOptions = {
+                    from: `LIGHTING MAP<${emailLighting}>`,
+                    to: adminEmails,
+                    subject: mailSubject,
+                    html: mailHtml
+                };
+                await transporter.sendMail(mailOptions);
+            } catch (e) {
+                debugMail('Errore nell\'invio email di notifica:', e);
+            }
+            return;
         }
 
         const existingIds = th.punti_luce.map(id => id.toString());
@@ -277,6 +317,16 @@ router.post('/update/', async (req, res) => {
 
         // Calcola cosa eliminare
         const { toDelete } = diffLightPoints(existingIds, incomingPoints);
+        eliminati = [...toDelete];
+
+        // Recupera i dati completi dei punti luce eliminati prima di cancellarli
+        if (eliminati.length > 0) {
+            eliminatiFull = await lightPoints.find({ _id: { $in: eliminati } }).lean().session(session);
+        }
+
+        // Calcola modificati e aggiunti
+        modificati = incomingPoints.filter(lp => lp._id && existingIds.includes(lp._id.toString())).map(lp => lp._id);
+        aggiunti = incomingPoints.filter(lp => !lp._id);
 
         // Elimina in bulk
         if (toDelete.length > 0) {
@@ -286,7 +336,42 @@ router.post('/update/', async (req, res) => {
         // Aggiorna/inserisci in bulk
         const bulkOps = prepareBulkOps(incomingPoints);
         if (bulkOps.length > 0) {
-            await lightPoints.bulkWrite(bulkOps, { session });
+            try {
+                await lightPoints.bulkWrite(bulkOps, { session });
+            } catch (bulkErr) {
+                // Errore durante bulkWrite
+                await session.abortTransaction();
+                session.endSession();
+                responseStatus = 500;
+                responseMessage = `Errore durante l'aggiornamento dei punti luce: ${bulkErr && bulkErr.message ? bulkErr.message : bulkErr.toString()}`;
+                mailSubject = 'Errore durante aggiornamento punti luce';
+                // Serializza solo il primo oggetto che ha causato errore (se disponibile)
+                const erroreOggetto = incomingPoints && incomingPoints.length > 0 ? incomingPoints[0] : null;
+                const oggettoString = erroreOggetto ? `<pre>${JSON.stringify(erroreOggetto, null, 2)}</pre>` : '<i>Nessun oggetto disponibile</i>';
+                const errorMsg = `<b>Errore:</b> ${bulkErr && bulkErr.message ? bulkErr.message : bulkErr.toString()}`;
+                mailHtml = `
+                    <h3>Errore durante l'aggiornamento dei punti luce</h3>
+                    <p><b>Oggetto che ha causato l'errore:</b></p>
+                    ${oggettoString}
+                    <p>${errorMsg}</p>
+                `;
+                res.status(responseStatus).send(responseMessage);
+                // Invio email dopo la risposta
+                try {
+                    const adminEmails = req.body.userEmail;
+                    const mailOptions = {
+                        from: `LIGHTING MAP<${emailLighting}>`,
+                        to: adminEmails,
+                        subject: mailSubject,
+                        html: mailHtml
+                    };
+                    await transporter.sendMail(mailOptions);
+                    debugMail(bulkErr);
+                } catch (e) {
+                    debugMail('Errore nell\'invio email:', e);
+                }
+                return;
+            }
         }
 
         // Recupera tutti gli _id aggiornati (inclusi quelli nuovi)
@@ -297,14 +382,80 @@ router.post('/update/', async (req, res) => {
         th.punti_luce = updatedLightPoints.map(lp => lp._id);
         await th.save({ session });
 
+        // Recupera i dati completi dei modificati e aggiunti
+        if (modificati.length > 0) {
+            modificatiFull = await lightPoints.find({ _id: { $in: modificati } }).lean().session(session);
+        }
+        if (aggiunti.length > 0) {
+            // Dopo la bulkWrite, i nuovi punti luce sono quelli con marker corrispondente e _id presente
+            const markersAggiunti = aggiunti.map(lp => lp.marker);
+            aggiuntiFull = await lightPoints.find({ marker: { $in: markersAggiunti } }).lean().session(session);
+        }
+
         await session.commitTransaction();
         session.endSession();
-        res.status(200).send('Comune e punti luce aggiornati con successo');
+
+        // Genera file Excel con 3 fogli
+        const XLSX = require('xlsx');
+        const workbook = XLSX.utils.book_new();
+        if (eliminatiFull.length > 0) {
+            const wsEliminati = XLSX.utils.json_to_sheet(eliminatiFull);
+            XLSX.utils.book_append_sheet(workbook, wsEliminati, 'Eliminati');
+        }
+        if (modificatiFull.length > 0) {
+            const wsModificati = XLSX.utils.json_to_sheet(modificatiFull);
+            XLSX.utils.book_append_sheet(workbook, wsModificati, 'Modificati');
+        }
+        if (aggiuntiFull.length > 0) {
+            const wsAggiunti = XLSX.utils.json_to_sheet(aggiuntiFull);
+            XLSX.utils.book_append_sheet(workbook, wsAggiunti, 'Aggiunti');
+        }
+        const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+
+        mailHtml = returnHtmlEmailUpdateSuccessSummary(req.body.name, eliminati, modificati, aggiunti);
+        res.status(responseStatus).send(responseMessage);
+        // Invio email dopo la risposta
+        try {
+            const adminEmails = req.body.userEmail;
+            const mailOptions = {
+                from: `LIGHTING MAP<${emailLighting}>`,
+                to: adminEmails,
+                subject: mailSubject,
+                html: mailHtml,
+                attachments: [
+                    {
+                        filename: `dettaglio_aggiornamento_${req.body.name}.xlsx`,
+                        content: buffer
+                    }
+                ]
+            };
+            await transporter.sendMail(mailOptions);
+        } catch (e) {
+            debugMail('Errore nell\'invio email di notifica:', e);
+        }
     } catch (err) {
         await session.abortTransaction();
         session.endSession();
-        console.error(err);
-        res.status(500).send('Errore del server');
+        responseStatus = 500;
+        responseMessage = 'Errore durante l\'aggiornamento';
+        mailSubject = 'Errore durante aggiornamento';
+        mailHtml = returnHtmlEmailUploadError(req.body.name, err?.message || '');
+        isError = true;
+        res.status(responseStatus).send(responseMessage + (err?.message ? (': ' + err.message) : ''));
+        // Invio email dopo la risposta
+        try {
+            const adminEmails = req.body.userEmail;
+            const mailOptions = {
+                from: `LIGHTING MAP<${emailLighting}>`,
+                to: adminEmails,
+                subject: mailSubject,
+                html: mailHtml
+            };
+            await transporter.sendMail(mailOptions);
+            debugMail(err);
+        } catch (e) {
+            debugMail('Errore nell\'invio email:', e);
+        }
     }
 });
 
