@@ -259,6 +259,7 @@ function returnHtmlEmailUpdateSuccessSummary(nomeComune, eliminati, modificati, 
 
 
 router.post('/update/', async (req, res) => {
+    console.log('update townhalls endpoint');
     const session = await mongoose.startSession();
     session.startTransaction();
     let responseStatus = 200;
@@ -300,6 +301,7 @@ router.post('/update/', async (req, res) => {
             }
             return;
         }
+
 
         const existingIds = th.punti_luce.map(id => id.toString());
         // Normalizza i dati se sono in formato tabulato
