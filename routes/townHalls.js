@@ -471,6 +471,11 @@ router.post('/update/', async (req, res) => {
             const wsAggiunti = XLSX.utils.json_to_sheet(aggiuntiFull);
             XLSX.utils.book_append_sheet(workbook, wsAggiunti, 'Aggiunti');
         }
+        // Se nessun foglio è stato aggiunto, aggiungi un foglio vuoto di servizio
+        if (workbook.SheetNames.length === 0) {
+            const wsVuoto = XLSX.utils.aoa_to_sheet([['Nessuna modifica rilevata']]);
+            XLSX.utils.book_append_sheet(workbook, wsVuoto, 'Nessuna Modifica');
+        }
         const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
         mailHtml = returnHtmlEmailUpdateSuccessSummary(req.body.name, eliminati, modificati, aggiunti);
         res.status(responseStatus).send(responseMessage);
