@@ -13,7 +13,6 @@ const router = express.Router();
 
 
 router.post('/', async (req, res) => {
-    console.log('create townhalls endpoint');
     const session = await mongoose.startSession();
     session.startTransaction();
     let batchStatus = [];
@@ -260,7 +259,6 @@ function returnHtmlEmailUpdateSuccessSummary(nomeComune, eliminati, modificati, 
 
 
 router.post('/update/', async (req, res) => {
-    console.log('update townhalls endpoint');
     const session = await mongoose.startSession();
     session.startTransaction();
     let responseStatus = 200;
@@ -280,6 +278,7 @@ router.post('/update/', async (req, res) => {
         // Recupera solo gli _id dei punti luce
         let th = await townHalls.findOne({ name: req.body.name }).session(session);
         if (!th) {
+            console.log('comune non trovato');
             await session.abortTransaction();
             session.endSession();
             responseStatus = 404;
@@ -302,14 +301,14 @@ router.post('/update/', async (req, res) => {
             }
             return;
         }
-
+        console.log('comune trovato');
 
         const existingIds = th.punti_luce.map(id => id.toString());
         // Normalizza i dati se sono in formato tabulato
         let incomingPoints = req.body.light_points || [];
         // Normalizza le chiavi di ogni oggetto punto luce a minuscolo
         incomingPoints = incomingPoints.map(normalizeKeysToLowerCase);
-
+        console.log('incomingPoints', incomingPoints.length);
         // Filtra i punti luce vuoti
         incomingPoints = incomingPoints.filter(lp => {
             if (!lp._id && isEmptyLightPoint(lp)) {
@@ -317,25 +316,25 @@ router.post('/update/', async (req, res) => {
             }
             return true; // Tieni tutti gli altri
         });
-
+        console.log('incomingPoints', incomingPoints.length);
         // Calcola cosa eliminare
         const { toDelete } = diffLightPoints(existingIds, incomingPoints);
         eliminati = [...toDelete];
-
+        console.log('eliminati', eliminati.length);
         // Recupera i dati completi dei punti luce eliminati prima di cancellarli
         if (eliminati.length > 0) {
             eliminatiFull = await lightPoints.find({ _id: { $in: eliminati } }).lean().session(session);
         }
-
+        console.log('eliminatiFull', eliminatiFull.length);
         // Calcola modificati e aggiunti
         modificati = incomingPoints.filter(lp => lp._id && existingIds.includes(lp._id.toString())).map(lp => lp._id);
         aggiunti = incomingPoints.filter(lp => !lp._id);
-
+        console.log('aggiunti', aggiunti.length);
         // Elimina in bulk
         if (toDelete.length > 0) {
             await lightPoints.deleteMany({ _id: { $in: toDelete } }).session(session);
         }
-
+        console.log('toDelete', toDelete.length);
         // Aggiorna/inserisci in bulk
         const bulkOps = prepareBulkOps(incomingPoints);
         if (bulkOps.length > 0) {
@@ -376,15 +375,15 @@ router.post('/update/', async (req, res) => {
                 return;
             }
         }
-
+        console.log('bulkOps', bulkOps.length);
         // Recupera tutti gli _id aggiornati (inclusi quelli nuovi)
         const updatedLightPoints = await lightPoints.find({
             marker: { $in: incomingPoints.map(lp => lp.marker) }
         }).session(session);
-
+        console.log('updatedLightPoints', updatedLightPoints.length);
         th.punti_luce = updatedLightPoints.map(lp => lp._id);
         await th.save({ session });
-
+        console.log('th', th.punti_luce.length);
         // Recupera i dati completi dei modificati e aggiunti
         if (modificati.length > 0) {
             modificatiFull = await lightPoints.find({ _id: { $in: modificati } }).lean().session(session);
@@ -394,10 +393,11 @@ router.post('/update/', async (req, res) => {
             const markersAggiunti = aggiunti.map(lp => lp.marker);
             aggiuntiFull = await lightPoints.find({ marker: { $in: markersAggiunti } }).lean().session(session);
         }
-
+        console.log('modificatiFull', modificatiFull.length);
+        console.log('aggiuntiFull', aggiuntiFull.length);
         await session.commitTransaction();
         session.endSession();
-
+        console.log('session.commitTransaction');
         // Genera file Excel con 3 fogli
         const XLSX = require('xlsx');
         const workbook = XLSX.utils.book_new();
@@ -414,9 +414,11 @@ router.post('/update/', async (req, res) => {
             XLSX.utils.book_append_sheet(workbook, wsAggiunti, 'Aggiunti');
         }
         const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-
+        console.log('buffer', buffer);  
         mailHtml = returnHtmlEmailUpdateSuccessSummary(req.body.name, eliminati, modificati, aggiunti);
+        console.log('mailHtml', mailHtml);
         res.status(responseStatus).send(responseMessage);
+        console.log('res.status(responseStatus).send(responseMessage)');
         // Invio email dopo la risposta
         try {
             const adminEmails = req.body.userEmail;
