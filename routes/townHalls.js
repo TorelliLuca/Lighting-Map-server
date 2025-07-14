@@ -376,11 +376,15 @@ router.post('/update/', async (req, res) => {
             }
         }
         console.log('bulkOps', bulkOps.length);
-        // Recupera tutti gli _id aggiornati (inclusi quelli nuovi)
-        const updatedLightPoints = await lightPoints.find({
-            marker: { $in: incomingPoints.map(lp => lp.marker) }
-        }).session(session);
-        console.log('updatedLightPoints', updatedLightPoints.length);
+        // Recupera tutti gli _id aggiornati (inclusi quelli nuovi) usando batch per evitare OOM
+        const uniqueMarkers = [...new Set(incomingPoints.map(lp => lp.marker))];
+        const BATCH_SIZE_UPDATE = 300;
+        let updatedLightPoints = [];
+        const markerBatches = chunkArray(uniqueMarkers, BATCH_SIZE_UPDATE);
+        for (const batch of markerBatches) {
+            const batchResults = await lightPoints.find({ marker: { $in: batch } }).session(session);
+            updatedLightPoints = updatedLightPoints.concat(batchResults);
+        }
         th.punti_luce = updatedLightPoints.map(lp => lp._id);
         await th.save({ session });
         console.log('th', th.punti_luce.length);
@@ -414,7 +418,7 @@ router.post('/update/', async (req, res) => {
             XLSX.utils.book_append_sheet(workbook, wsAggiunti, 'Aggiunti');
         }
         const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-        console.log('buffer', buffer);  
+        console.log('buffer', buffer);
         mailHtml = returnHtmlEmailUpdateSuccessSummary(req.body.name, eliminati, modificati, aggiunti);
         console.log('mailHtml', mailHtml);
         res.status(responseStatus).send(responseMessage);
@@ -466,21 +470,21 @@ router.post('/update/', async (req, res) => {
 
 router.patch('/lightPoints/update/:_id', async (req, res) => {
 
-    const _id = req.params._id; 
-    const lpToUpdate = req.body; 
+    const _id = req.params._id;
+    const lpToUpdate = req.body;
 
     try {
         const updatedLP = await lightPoints.findOneAndUpdate(
-            { _id: _id }, 
-            lpToUpdate, 
-            { new: true } 
+            { _id: _id },
+            lpToUpdate,
+            { new: true }
         );
 
         if (!updatedLP) {
             return res.status(404).send("Punto luce non trovato.");
         }
 
-        res.send(updatedLP); 
+        res.send(updatedLP);
     } catch (error) {
         res.status(500).send("Errore del server: " + error.message);
     }
@@ -489,18 +493,18 @@ router.patch('/lightPoints/update/:_id', async (req, res) => {
 router.get('/', async (req, res) => {
     try {
         const thList = await townHalls.find({});
-        
+
         const transformedList = thList.map(th => {
             const thObject = th.toObject(); // Converte il documento Mongoose in un oggetto JavaScript
-            
+
             const puntiLuceLength = th.punti_luce ? th.punti_luce.length : 0;
-            
+
             delete thObject.punti_luce;
             thObject.light_points = puntiLuceLength;
-            
+
             return thObject;
         });
-        
+
         res.json(transformedList);
     } catch (err) {
         console.error(err);
@@ -522,9 +526,9 @@ router.get('/:name', async (req, res) => {
                 }, {
                     path: 'operazioni_effettuate',
                     model: 'operations',
-                    populate: [{ 
+                    populate: [{
                         path: 'operation_point_id',
-                        model: 'lightPoints' 
+                        model: 'lightPoints'
                     }, {
                         path: 'operation_responsible',
                         model: 'users' ,
@@ -533,7 +537,7 @@ router.get('/:name', async (req, res) => {
                         path: 'report_to_solve',
                         model: 'reports'
                     }
-                
+
                 ]
                 }]
             });
