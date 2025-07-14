@@ -431,6 +431,32 @@ router.post('/update/', async (req, res) => {
         session.endSession();
         console.log("arrivato alla fine delle operazioni, tutto ok")
         // 10. Genera file Excel con 3 fogli
+
+    } catch (err) {
+        try {await session.abortTransaction();} catch (e) {}
+        session.endSession();
+        responseStatus = 500;
+        responseMessage = 'Errore durante l\'aggiornamento';
+        mailSubject = 'Errore durante aggiornamento';
+        mailHtml = returnHtmlEmailUploadError(req.body.name, err?.message || '');
+        isError = true;
+        res.status(responseStatus).send(responseMessage + (err?.message ? (': ' + err.message) : ''));
+        // Invio email dopo la risposta
+        try {
+            const adminEmails = req.body.userEmail;
+            const mailOptions = {
+                from: `LIGHTING MAP<${emailLighting}>`,
+                to: adminEmails,
+                subject: mailSubject,
+                html: mailHtml
+            };
+            await transporter.sendMail(mailOptions);
+            debugMail(err);
+        } catch (e) {
+            debugMail('Errore nell\'invio email:', e);
+        }
+    }
+    try {
         const XLSX = require('xlsx');
         const workbook = XLSX.utils.book_new();
         if (eliminatiFull.length > 0) {
@@ -467,29 +493,8 @@ router.post('/update/', async (req, res) => {
         } catch (e) {
             debugMail('Errore nell\'invio email di notifica:', e);
         }
-    } catch (err) {
-        await session.abortTransaction();
-        session.endSession();
-        responseStatus = 500;
-        responseMessage = 'Errore durante l\'aggiornamento';
-        mailSubject = 'Errore durante aggiornamento';
-        mailHtml = returnHtmlEmailUploadError(req.body.name, err?.message || '');
-        isError = true;
-        res.status(responseStatus).send(responseMessage + (err?.message ? (': ' + err.message) : ''));
-        // Invio email dopo la risposta
-        try {
-            const adminEmails = req.body.userEmail;
-            const mailOptions = {
-                from: `LIGHTING MAP<${emailLighting}>`,
-                to: adminEmails,
-                subject: mailSubject,
-                html: mailHtml
-            };
-            await transporter.sendMail(mailOptions);
-            debugMail(err);
-        } catch (e) {
-            debugMail('Errore nell\'invio email:', e);
-        }
+    }catch(e){
+        console.log("errore nella generazione del file excel",e)
     }
 });
 
