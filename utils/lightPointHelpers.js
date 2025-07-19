@@ -12,7 +12,8 @@ async function getPuntoLuceById(id) {
 
 async function getAllPuntiLuce(ids) {
     try {
-        const puntiLuce = await Promise.all(ids.map(id => getPuntoLuceById(id)));
+        // Ottimizzazione: una sola query per tutti gli id
+        const puntiLuce = await light_points.find({ _id: { $in: ids } });
         return puntiLuce;
     } catch (error) {
         console.error('Errore nel recuperare i punti luce:', error);

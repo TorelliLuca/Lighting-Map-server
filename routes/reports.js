@@ -9,6 +9,7 @@ const logAccess = require('../utils/accessLogger');
 const router = express.Router();
 
 router.post('/addReport', async (req, res) => {
+
     try {
         const th = await townHalls.findOne({ name: {$eq: req.body.name} });
 
@@ -16,8 +17,11 @@ router.post('/addReport', async (req, res) => {
             return res.status(404).send('Comune non trovato');
         }
 
+
         const ids = th.punti_luce;
+
         const puntiLuce = await getAllPuntiLuce(ids);
+
 
         const puntoLuce = puntiLuce.find(punto => {
             if (punto) {
@@ -39,7 +43,9 @@ router.post('/addReport', async (req, res) => {
 
         puntoLuce.segnalazioni_in_corso.push(nuovaSegnalazione);
 
+
         await nuovaSegnalazione.save();
+
         await light_points.updateOne({_id: puntoLuce.id}, {$set: {segnalazioni_in_corso: puntoLuce.segnalazioni_in_corso}});
         await townHalls.updateOne({ name: {$eq: req.body.name} }, { $set: { punti_luce: th.punti_luce } });
 
@@ -53,6 +59,8 @@ router.post('/addReport', async (req, res) => {
             userAgent: req.headers['user-agent'],
             details: `Report creato con id: ${nuovaSegnalazione._id}`
         });
+
+
 
         res.send('Segnalazione aggiunta con successo');
 

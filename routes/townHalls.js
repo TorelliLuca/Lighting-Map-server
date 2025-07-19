@@ -664,6 +664,100 @@ router.get('/lightpoints/getPoint/', async (req, res) => {
     }
 });
 
+router.get('/lightpoints/getPointGeoJSON/', async (req, res) => {
+    try {
+        const { name, numero_palo } = req.query;
+
+        if (!name || !numero_palo) {
+            return res.status(400).send('Nome del comune e numero del palo sono richiesti.');
+        }
+
+        const townHall = await townHalls.findOne({ name: name }).populate({
+            path: 'punti_luce',
+            match: { numero_palo: numero_palo },
+        });
+
+        if (!townHall || !townHall.punti_luce || townHall.punti_luce.length === 0) {
+            return res.status(404).send('Palo non trovato.');
+        }
+
+        const pl = townHall.punti_luce[0];
+        if (!pl || typeof pl.lat !== 'number' || typeof pl.lng !== 'number') {
+            return res.status(400).send('Coordinate non valide per il punto luce.');
+        }
+
+        // Costruisci il GeoJSON
+        const geojson = {
+            type: "Feature",
+            city: townHall.name,
+            geometry: {
+                type: "Point",
+                coordinates: [pl.lng, pl.lat]
+            },
+            properties: { ...pl.toObject ? pl.toObject() : pl }
+        };
+        // Rimuovi lat/lng da properties (già in geometry)
+        delete geojson.properties.lat;
+        delete geojson.properties.lng;
+
+        res.json(geojson);
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Errore del server');
+    }
+});
+
+router.get('/:name/geojson', async (req, res) => {
+    try {
+        const th = await townHalls.findOne({ name: req.params.name })
+            .populate({
+                path: 'punti_luce',
+                populate: [
+                    { path: 'segnalazioni_in_corso', model: 'reports' },
+                    { path: 'segnalazioni_risolte', model: 'reports' },
+                    { path: 'operazioni_effettuate', model: 'operations',
+                        populate: [
+                            { path: 'operation_point_id', model: 'lightPoints' },
+                            { path: 'operation_responsible', model: 'users', select: 'name surname email' },
+                            { path: 'report_to_solve', model: 'reports' }
+                        ]
+                    }
+                ]
+            });
+
+        if (!th || !th.punti_luce || th.punti_luce.length === 0) {
+            return res.status(404).send('Comune o punti luce non trovati');
+        }
+
+        // Costruisci la FeatureCollection GeoJSON
+        const features = th.punti_luce
+
+            .map(pl => {
+                const props = pl.toObject ? pl.toObject() : pl;
+                const { lat, lng, ...rest } = props;
+                return {
+                    type: "Feature",
+                    geometry: {
+                        type: "Point",
+                        coordinates: [parseFloat(lng.replace(",", ".")), parseFloat(lat.replace(",", "."))]
+                    },
+                    properties: rest
+                };
+            });
+
+        const geojson = {
+            type: "FeatureCollection",
+            city: th.name,
+            features
+        };
+
+        res.json(geojson);
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Errore del server');
+    }
+});
+
 router.post('/api/downloadExcelTownHall', function (req, res) {
     try {
         const jsonData = req.body;
@@ -722,6 +816,189 @@ router.post('/api/downloadCsvTownHall', function (req, res) {
         res.send(csv);
     } catch (err) {
         res.status(500).send('Errore nella generazione del CSV');
+    }
+});
+
+// Endpoint: /townHalls/lightPoints/viewport
+// Metodo: POST
+// Body: north, south, east, west, city, filter (opzionale), limit (es: 200)
+router.post('/lightPoints/viewport', async (req, res) => {
+    try {
+        const north = req.body.north;
+        const south = req.body.south;
+        const east = req.body.east;
+        const west = req.body.west;
+        const city = req.body.city;
+        const filter = req.body.filter || 'SELECT';
+        const limit = parseInt(req.body.limit) || 200;
+
+        if (!city || isNaN(north) || isNaN(south) || isNaN(east) || isNaN(west)) {
+            return res.status(400).json({ error: 'Parametri mancanti o non validi' });
+        }
+
+        // Trova il comune
+        const townHall = await townHalls.findOne({ name: city }).select('punti_luce');
+        if (!townHall) {
+            return res.status(404).json({ error: 'Comune non trovato' });
+        }
+
+        // Conta tutti i marker del comune (per total_count)
+        const total_count = await lightPoints.countDocuments({ _id: { $in: townHall.punti_luce } });
+
+        // Costruisci la query base
+        let query = {
+            _id: { $in: townHall.punti_luce },
+            lat: { $gte: south, $lte: north },
+            lng: { $gte: west, $lte: east }
+        };
+
+        // Applica filtro custom
+        if (filter === 'REPORTED') {
+            query.segnalazioni_in_corso = { $exists: true, $not: { $size: 0 } };
+        } else if (filter === 'MARKER') {
+            query.marker = 'QE';
+        } else if (filter === 'PROPRIETA') {
+            query.proprieta = { $in: ['comunale', 'enelsole'] };
+        }
+        // SELECT = nessun filtro aggiuntivo
+
+        // Recupera i marker (limite impostato), tutti i campi
+        const markers = await lightPoints.find(query)
+            .limit(limit);
+
+        res.json({
+            markers,
+            total_count
+        });
+    } catch (error) {
+        res.status(500).json({ error: 'Errore del server', details: error.message });
+    }
+});
+
+// Endpoint: /townHalls/lightPoints/clusters
+// Metodo: POST
+// Body: north, south, east, west, zoom, city, filter (opzionale)
+router.post('/lightPoints/clusters', async (req, res) => {
+    try {
+        const north = req.body.north;
+        const south = req.body.south;
+        const east = req.body.east;
+        const west = req.body.west;
+        const city = req.body.city;
+        const filter = req.body.filter || 'SELECT';
+        const zoom = parseInt(req.body.zoom);
+
+        if (!city || north === undefined || south === undefined || east === undefined || west === undefined || isNaN(zoom)) {
+            return res.status(400).json({ error: 'Parametri mancanti o non validi' });
+        }
+
+        // Trova il comune
+        const townHall = await townHalls.findOne({ name: city }).select('punti_luce');
+        if (!townHall) {
+            return res.status(404).json({ error: 'Comune non trovato' });
+        }
+
+        // Conta tutti i marker del comune (per total_count)
+        const total_count = await lightPoints.countDocuments({ _id: { $in: townHall.punti_luce } });
+
+        // Costruisci la query base
+        let query = {
+            _id: { $in: townHall.punti_luce },
+            lat: { $gte: south, $lte: north },
+            lng: { $gte: west, $lte: east }
+        };
+
+        // Applica filtro custom
+        if (filter === 'REPORTED') {
+            query.segnalazioni_in_corso = { $exists: true, $not: { $size: 0 } };
+        } else if (filter === 'MARKER') {
+            query.marker = 'QE';
+        } else if (filter === 'PROPRIETA') { //!!DA METTERE A POSTO 
+            query.proprieta = { $in: ['comunale', 'enelsole'] };
+        }
+        // SELECT = nessun filtro aggiuntivo
+
+        // Recupera tutti i marker nella bounding box e filtri
+        const markers = await lightPoints.find(query).select('lat lng');
+
+        // Calcola la dimensione della cella in base allo zoom (logica Google Maps)
+        // Più lo zoom è basso, più la cella è grande
+        // Esempio: zoom 8 = celle grandi, zoom 16 = celle piccole
+        // Possiamo usare una griglia 2^(zoom-8) x 2^(zoom-8) (min 1x1, max 32x32)
+        let gridSize = Math.max(1, Math.pow(2, zoom - 8));
+        if (zoom < 8) gridSize = 1;
+        if (zoom > 16) gridSize = 32;
+
+        const latStep = (north - south) / gridSize;
+        const lngStep = (east - west) / gridSize;
+
+        // Mappa per clusterizzare
+        const clusterMap = new Map();
+
+        markers.forEach(marker => {
+            const lat = parseFloat(marker.lat);
+            const lng = parseFloat(marker.lng);
+            if (isNaN(lat) || isNaN(lng)) return;
+            // Calcola la cella
+            const latIdx = Math.floor((lat - south) / latStep);
+            const lngIdx = Math.floor((lng - west) / lngStep);
+            const key = `${latIdx}_${lngIdx}`;
+            if (!clusterMap.has(key)) {
+                clusterMap.set(key, []);
+            }
+            clusterMap.get(key).push({ lat, lng });
+        });
+
+        // Costruisci i cluster
+        const clusters = [];
+        for (const [key, points] of clusterMap.entries()) {
+            const [latIdx, lngIdx] = key.split('_').map(Number);
+            const count = points.length;
+            const lat = points.reduce((sum, p) => sum + p.lat, 0) / count;
+            const lng = points.reduce((sum, p) => sum + p.lng, 0) / count;
+            const bounds = {
+                north: south + latStep * (latIdx + 1),
+                south: south + latStep * latIdx,
+                east: west + lngStep * (lngIdx + 1),
+                west: west + lngStep * lngIdx
+            };
+            clusters.push({ count, lat, lng, bounds });
+        }
+
+        res.json({
+            clusters,
+            total_count
+        });
+    } catch (error) {
+        res.status(500).json({ error: 'Errore del server', details: error.message });
+    }
+});
+
+// Endpoint: /townHalls/lightPoints/counts
+// Restituisce: { "ComuneA": 1200, ... } solo per i comuni dell'utente se userId è fornito
+router.get('/lightPoints/counts', async (req, res) => {
+    try {
+        const userId = req.query.userId;
+        let thList;
+        if (userId) {
+            // Recupera l'utente e la sua lista di comuni
+            const user = await users.findById(userId).select('town_halls_list');
+            if (!user || !user.town_halls_list || user.town_halls_list.length === 0) {
+                return res.json({});
+            }
+            thList = await townHalls.find({ _id: { $in: user.town_halls_list } }).select('name punti_luce');
+        } else {
+            // Nessun filtro utente, restituisci tutti i comuni
+            thList = await townHalls.find({}).select('name punti_luce');
+        }
+        const result = {};
+        thList.forEach(th => {
+            result[th.name] = th.punti_luce ? th.punti_luce.length : 0;
+        });
+        res.json(result);
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Errore del server');
     }
 });
 
