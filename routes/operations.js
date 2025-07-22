@@ -11,10 +11,14 @@ const reports = require('../schemas/reports');
 const router = express.Router();    
 
 router.post('/addOperation', async (req, res) => {
+    const session = await mongoose.startSession();
+    session.startTransaction();
     try {
-        const th = await townHalls.findOne({ name: {$eq: req.body.name} });
+        const th = await townHalls.findOne({ name: {$eq: req.body.name} }).session(session);
 
         if (!th) {
+            await session.abortTransaction();
+            session.endSession();
             return res.status(404).send('Comune non trovato');
         }
 
@@ -30,11 +34,15 @@ router.post('/addOperation', async (req, res) => {
         });
         
         if (!puntoLuce) {
+            await session.abortTransaction();
+            session.endSession();
             return res.status(404).send('Punto luce non trovato');
         }
 
-        const user = await users.findOne({email: {$eq:req.body.email}});
+        const user = await users.findOne({email: {$eq:req.body.email}}).session(session);
         if (!user) {
+            await session.abortTransaction();
+            session.endSession();
             return res.status(404).send('utente non trovato');
         }
 
@@ -49,6 +57,8 @@ router.post('/addOperation', async (req, res) => {
         });
 
         if(!report && req.body.id_segnalazione !== null){
+            await session.abortTransaction();
+            session.endSession();
             return res.status(404).send('segnalazione non trovata');
         }
         
@@ -68,15 +78,26 @@ router.post('/addOperation', async (req, res) => {
         });
 
         if (req.body.is_solved && report) {
+            report.is_solved = true;
+            report.user_responsible_id = user._id;
+            await report.save({ session });
             puntoLuce.segnalazioni_in_corso.pull(report);
             puntoLuce.segnalazioni_risolte.push(report);
         }
 
         puntoLuce.operazioni_effettuate.push(nuovaOperazione);
 
-        await nuovaOperazione.save();
-        await light_points.updateOne({ _id: puntoLuce._id }, { $set: { operazioni_effettuate: puntoLuce.operazioni_effettuate, segnalazioni_in_corso: puntoLuce.segnalazioni_in_corso, segnalazioni_risolte: puntoLuce.segnalazioni_risolte } });
-        await townHalls.updateOne({ name: {$eq: req.body.name} }, { $set: { punti_luce: th.punti_luce } });
+        await nuovaOperazione.save({ session });
+        await light_points.updateOne(
+            { _id: puntoLuce._id },
+            { $set: { operazioni_effettuate: puntoLuce.operazioni_effettuate, segnalazioni_in_corso: puntoLuce.segnalazioni_in_corso, segnalazioni_risolte: puntoLuce.segnalazioni_risolte } },
+            { session }
+        );
+        await townHalls.updateOne(
+            { name: {$eq: req.body.name} },
+            { $set: { punti_luce: th.punti_luce } },
+            { session }
+        );
         
         // Log dettagliato
         await logAccess({
@@ -88,9 +109,13 @@ router.post('/addOperation', async (req, res) => {
             userAgent: req.headers['user-agent'],
             details: `Operazione creata con id: ${nuovaOperazione._id}`
         });
-        
+
+        await session.commitTransaction();
+        session.endSession();
         res.send('Operazione aggiunta con successo');
     } catch (error) {
+        await session.abortTransaction();
+        session.endSession();
         // Log errore
         await logAccess({
             user: req.user ? req.user._id : null,
@@ -157,4 +182,4 @@ router.get('/api/avg-time-report-operation/:comune', async (req, res) => {
     }
 });
 
-module.exports = router; 
+module.exports = router;

@@ -575,29 +575,49 @@ router.get('/:name', async (req, res) => {
         const th = await townHalls.findOne({ name: req.params.name })
             .populate({
                 path: 'punti_luce',
-                populate: [{
-                    path: 'segnalazioni_in_corso',
-                    model: 'reports'
-                }, {
-                    path: 'segnalazioni_risolte',
-                    model: 'reports'
-                }, {
-                    path: 'operazioni_effettuate',
-                    model: 'operations',
-                    populate: [{
-                        path: 'operation_point_id',
-                        model: 'lightPoints'
-                    }, {
-                        path: 'operation_responsible',
-                        model: 'users' ,
-                        select: 'name surname email'
-                    },{
-                        path: 'report_to_solve',
-                        model: 'reports'
+                populate: [
+                    {
+                        path: 'segnalazioni_in_corso',
+                        model: 'reports',
+                        populate: {
+                            path: 'user_creator_id',
+                            model: 'users',
+                            select: 'name surname email'
+                        }
+                    },
+                    {
+                        path: 'segnalazioni_risolte',
+                        model: 'reports',
+                        populate: [{
+                            path: 'user_creator_id',
+                            model: 'users',
+                            select: 'name surname email'
+                        }, {
+                            path: 'user_responsible_id',
+                            model: 'users',
+                            select: 'name surname email'
+                        }]
+                    },
+                    {
+                        path: 'operazioni_effettuate',
+                        model: 'operations',
+                        populate: [
+                            {
+                                path: 'operation_point_id',
+                                model: 'lightPoints'
+                            },
+                            {
+                                path: 'operation_responsible',
+                                model: 'users',
+                                select: 'name surname email'
+                            },
+                            {
+                                path: 'report_to_solve',
+                                model: 'reports'
+                            }
+                        ]
                     }
-
                 ]
-                }]
             });
 
         if (th) {
@@ -1002,4 +1022,4 @@ router.get('/lightPoints/counts', async (req, res) => {
     }
 });
 
-module.exports = router; 
+module.exports = router;

@@ -2,13 +2,16 @@ const { Schema, model } = require("mongoose")
 //metodi della costante
 const schema = new Schema({
     operation_point_id:{type: Schema.Types.ObjectId, ref: "lightPoints"},
+    user_creator_id: {type: Schema.Types.ObjectId, ref: "users"},
+    user_responsible_id: {type: Schema.Types.ObjectId, ref: "users", default: null},
     report_date: {type: Date, default: Date.now()},
     report_time: {type: String, default: ()=> {
         let date = new Date(Date.now())
         return (date.getHours().toString().padStart(2, '0')+":" +date.getUTCMinutes().toString().padStart(2, '0'))
     }},
     report_type: {type: String, enum: ["LIGHT_POINT_OFF", "PLANT_OFF", "DAMAGED_COMPLEX", "DAMAGED_SUPPORT", "BROKEN_TERMINAL_BLOCK", "BROKEN_PANEL", "OTHER"], default: "LIGHT_POINT_OFF"},
-    description: {type: String, default: ""}
+    description: {type: String, default: ""},
+    is_solved: {type: Boolean, default: false},
 })
 
 //per esportare il modello

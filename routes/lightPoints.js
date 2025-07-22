@@ -32,8 +32,9 @@ router.post('/update/:_id', async (req, res) => {
 });
 
 router.post('/create', async (req, res) => {
-    const lpToCreate = req.body.light_point;
-    const townHall = await townHalls.findOne({name: req.body.town_hall});
+    const { light_point: lpToCreate, town_hall: townHallName, return_object: returnObject } = req.body;
+    
+    const townHall = await townHalls.findOne({name: townHallName});
     if(!townHall) {
         return res.status(404).send("Comune non trovato.");
     }
@@ -49,7 +50,11 @@ router.post('/create', async (req, res) => {
         await townHall.save({ session });
 
         await session.commitTransaction();
-        res.status(201).send("Punto luce creato con successo.");    
+
+        if (returnObject === true) {
+            return res.status(201).json(newLP);
+        }
+        res.status(201).send("Punto luce creato con successo.");
     } catch (error) {
         await session.abortTransaction();
         res.status(500).send("Errore del server: " + error.message);
@@ -76,6 +81,19 @@ router.delete('/delete/:_id',  async (req, res) => {
         res.status(500).send("Errore del server: " + error.message);
     }
     
+});
+
+router.get('/:_id', async (req, res) => {
+    const _id = req.params._id;
+    try {
+        const lightPoint = await lightPoints.findById(_id);
+        if (!lightPoint) {
+            return res.status(404).send("Punto luce non trovato.");
+        }
+        res.json(lightPoint);
+    } catch (error) {
+        res.status(500).send("Errore del server: " + error.message);
+    }
 });
 
 module.exports = router; 

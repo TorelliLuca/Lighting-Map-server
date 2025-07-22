@@ -38,7 +38,8 @@ router.post('/addReport', async (req, res) => {
         const nuovaSegnalazione = new reports({
             report_type: req.body.report_type,
             description: req.body.description,
-            report_date: req.body.date 
+            report_date: req.body.date,
+            user_creator_id: req.body.user_creator_id
         });
 
         puntoLuce.segnalazioni_in_corso.push(nuovaSegnalazione);
