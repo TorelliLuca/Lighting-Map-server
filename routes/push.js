@@ -58,18 +58,24 @@ router.post('/send-test-push', async (req, res) => {
         const subs = await Subscription.find({ isActive: true });
         const payload = JSON.stringify({ title, body });
         let success = 0, fail = 0;
+        let failed = [];
+        let successed = [];
         for (const sub of subs) {
             try {
-                await webpush.sendNotification({
+                console.log(payload);
+                const resp = await webpush.sendNotification({
                     endpoint: sub.endpoint,
                     keys: sub.keys
                 }, payload);
+                successed.push(resp);
                 success++;
             } catch (err) {
+                console.log(err);
+                failed.push(sub.endpoint);
                 fail++;
             }
         }
-        res.json({ message: `Notifiche inviate: ${success}, fallite: ${fail}` });
+        res.json({ message: `Notifiche inviate: ${success}, fallite: ${fail}`, failed, successed });
     } catch (err) {
         res.status(500).json({ error: 'Errore durante l\'invio delle notifiche' });
     }
