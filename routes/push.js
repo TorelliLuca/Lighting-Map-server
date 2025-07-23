@@ -67,6 +67,7 @@ router.post('/send-test-push', async (req, res) => {
                     endpoint: sub.endpoint,
                     keys: sub.keys
                 }, payload);
+                console.log(resp);
                 successed.push(resp);
                 success++;
             } catch (err) {
