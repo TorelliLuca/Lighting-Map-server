@@ -62,16 +62,16 @@ router.post('/send-test-push', async (req, res) => {
         let successed = [];
         for (const sub of subs) {
             try {
-                console.log(payload);
+                console.log("sub:", sub);
                 const resp = await webpush.sendNotification({
                     endpoint: sub.endpoint,
                     keys: sub.keys
                 }, payload);
-                console.log(resp);
+                console.log("Response di successo:", resp);
                 successed.push(resp);
                 success++;
             } catch (err) {
-                console.log(err);
+                console.log("Response di errore:", err);
                 failed.push(sub.endpoint);
                 fail++;
             }
