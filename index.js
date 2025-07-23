@@ -65,7 +65,6 @@ if (process.env.NODE_ENV === 'production') {
         credentials: false
     };
 }
-console.log(process.env.VAPID_PUBLIC_KEY, process.env.VAPID_PRIVATE_KEY);
 webpush.setVapidDetails(
     `mailto:${process.env.ADMIN_EMAIL}`,
     process.env.VAPID_PUBLIC_KEY,
