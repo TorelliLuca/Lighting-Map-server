@@ -215,7 +215,7 @@ table, td { color: #000000; } </style>
         
   <!--[if mso]><style>.v-button {background: transparent !important;}</style><![endif]-->
 <div align="center">
-  <!--[if mso]><v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" xmlns:w="urn:schemas-microsoft-com:office:word" href="" style="height:37px; v-text-anchor:middle; width:189px;" arcsize="11%"  stroke="f" fillcolor="#3cff34"><w:anchorlock/><center style="color:#FFFFFF;"><![endif]-->
+  <!--[if mso]><v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" xmlns:w="urn:schemas-microsoft-com:office:word" href="LINK_AL_RESET" style="height:37px; v-text-anchor:middle; width:189px;" arcsize="11%"  stroke="f" fillcolor="#3cff34"><w:anchorlock/><center style="color:#FFFFFF;"><![endif]-->
     <a href="LINK_AL_RESET" target="_blank" class="v-button" style="box-sizing: border-box; display: inline-block; text-decoration: none; text-size-adjust: none; text-align: center; color: rgb(255, 255, 255); background: rgb(60, 255, 52); border-radius: 4px; width: auto; max-width: 100%; word-break: break-word; overflow-wrap: break-word; font-size: 14px; line-height: inherit;"><span style="display:block;padding:10px 35px;line-height:120%;"><strong><span style="font-size: 14px; line-height: 16.8px; font-family: Cabin, sans-serif;">RESET PASSWORD</span></strong></span>
     </a>
     <!--[if mso]></center></v:roundrect><![endif]-->

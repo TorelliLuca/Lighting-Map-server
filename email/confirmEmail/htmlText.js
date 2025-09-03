@@ -151,7 +151,7 @@ table, td { color: #000000; } @media (max-width: 480px) { #u_content_image_1 .v-
         
   <!--[if mso]><style>.v-button {background: transparent !important;}</style><![endif]-->
 <div class="v-text-align" align="center">
-  <!--[if mso]><v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" xmlns:w="urn:schemas-microsoft-com:office:word" href="https://www.unlayer.com" style="height:49px; v-text-anchor:middle; width:255px;" arcsize="8%"  stroke="f" fillcolor="#0aadb6"><w:anchorlock/><center style="color:#FFFFFF;"><![endif]-->
+  <!--[if mso]><v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" xmlns:w="urn:schemas-microsoft-com:office:word" href="URL_CONFIRM" style="height:49px; v-text-anchor:middle; width:255px;" arcsize="8%"  stroke="f" fillcolor="#0aadb6"><w:anchorlock/><center style="color:#FFFFFF;"><![endif]-->
     <a href="URL_CONFIRM" target="_blank" class="v-button v-size-width v-font-size" style="box-sizing: border-box; display: inline-block; text-decoration: none; text-size-adjust: none; text-align: center; color: rgb(255, 255, 255); background: rgb(10, 173, 182); border-radius: 4px; width: 44%; max-width: 100%; word-break: break-word; overflow-wrap: break-word; font-size: 14px; letter-spacing: 0.3px; line-height: inherit;"><span style="display:block;padding:10px 20px;line-height:210%;"><strong><span style="line-height: 29.4px;">Conferma Email</span></strong></span>
     </a>
     <!--[if mso]></center></v:roundrect><![endif]-->
