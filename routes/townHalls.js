@@ -183,12 +183,12 @@ router.post('/', async (req, res) => {
     }
 });
 
-router.delete('/', async (req, res) => {
+router.delete('/:id', async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
     try {
-        const townHallName = req.body.name;
-        const townHall = await townHalls.findOne({ name: {$eq: townHallName} }).session(session);
+        const townHallId = req.params.id;
+        const townHall = await townHalls.findById(townHallId).session(session);
         if (!townHall) {
             await session.abortTransaction();
             session.endSession();
@@ -550,7 +550,7 @@ router.patch('/lightPoints/update/:_id', async (req, res) => {
 
 router.get('/', async (req, res) => {
     try {
-        const thList = await townHalls.find({});
+        const thList = await townHalls.find({}).sort({ name: 1 });
 
         const transformedList = thList.map(th => {
             const thObject = th.toObject(); // Converte il documento Mongoose in un oggetto JavaScript

@@ -7,43 +7,53 @@ const mongoose = require('mongoose');
 router.get('/stats/monthly-users', async (req, res) => {
   try {
     const result = await AccessLog.aggregate([
-      { $match: { action: "LOGIN", outcome: "SUCCESS", user: { $ne: null } } },
-      {
-        $group: {
-          _id: {
-            year: { $year: "$timestamp" },
-            month: { $month: "$timestamp" }
-          },
-          users: { $addToSet: "$user" }
-        }
+  { $match: { action: "LOGIN", outcome: "SUCCESS", user: { $ne: null } } },
+  {
+    $group: {
+      _id: {
+        year: { $year: "$timestamp" },
+        month: { $month: "$timestamp" }
       },
-      { $unwind: "$users" },
-      {
-        $lookup: {
-          from: "users",
-          localField: "users",
-          foreignField: "_id",
-          as: "userInfo"
+      users: { $addToSet: "$user" }
+    }
+  },
+  { $unwind: "$users" },
+  {
+    $lookup: {
+      from: "users",
+      localField: "users",
+      foreignField: "_id",
+      as: "userInfo"
+    }
+  },
+  { $unwind: "$userInfo" },
+
+  { $sort: { "userInfo.name": 1, "userInfo.surname": 1 } },
+
+  {
+    $group: {
+      _id: { year: "$_id.year", month: "$_id.month" },
+      users: {
+        $push: {
+          _id: "$userInfo._id",
+          name: "$userInfo.name",
+          surname: "$userInfo.surname"
         }
-      },
-      { $unwind: "$userInfo" },
-      {
-        $group: {
-          _id: { year: "$_id.year", month: "$_id.month" },
-          users: { $push: { _id: "$userInfo._id", name: "$userInfo.name", surname: "$userInfo.surname" } }
-        }
-      },
-      {
-        $project: {
-          year: "$_id.year",
-          month: "$_id.month",
-          users: 1,
-          userCount: { $size: "$users" },
-          _id: 0
-        }
-      },
-      { $sort: { year: 1, month: 1 } }
-    ]);
+      }
+    }
+  },
+  {
+    $project: {
+      year: "$_id.year",
+      month: "$_id.month",
+      users: 1,
+      userCount: { $size: "$users" },
+      _id: 0
+    }
+  },
+  { $sort: { year: 1, month: 1 } }
+]);
+
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -136,6 +146,31 @@ router.get('/stats/failed-requests', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+router.get('/stats/failed-requests-details/:action', async (req, res) => {
+  try {
+    const result = await AccessLog.aggregate([
+      { $match: { outcome: "FAILURE", action: req.params.action } },
+       {
+        $lookup: {
+          from: 'users', 
+          localField: 'user', 
+          foreignField: '_id',
+          as: 'userDetails' 
+        }
+      },
+      {
+        $unwind: {
+            path: "$userDetails",
+            preserveNullAndEmptyArrays: true 
+        }
+      },
+      { $sort: { timestamp: 1 } }
+    ]);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // 6. Heatmap delle azioni
 router.get('/stats/action-heatmap', async (req, res) => {
@@ -145,7 +180,12 @@ router.get('/stats/action-heatmap', async (req, res) => {
         $group: {
           _id: {
             action: "$action",
-            hour: { $hour: "$timestamp" }
+            hour: { 
+              $hour: { 
+                date: "$timestamp", 
+                timezone: "Europe/Rome" 
+              } 
+            }
           },
           count: { $sum: 1 }
         }
@@ -166,4 +206,117 @@ router.get('/stats/action-heatmap', async (req, res) => {
   }
 });
 
-module.exports = router; 
+
+
+function getFirstDayOfCurrentMonth() {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), 1);
+}
+
+// Helper function to get first day of previous month
+function getFirstDayOfPreviousMonth() {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth() - 1, 1);
+}
+
+// Helper function to get last day of previous month
+function getLastDayOfPreviousMonth() {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
+}
+
+// 7. New users this month - count
+router.get('/newUsersThisMonth', async (req, res) => {
+  try {
+    const firstDay = getFirstDayOfCurrentMonth();
+    const count = await require('../schemas/users').countDocuments({ date: { $gte: firstDay } });
+    res.json({ newUsersThisMonth: count });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 10. Percentage of new users compared to previous month
+router.get('/newUsersPercentageChange', async (req, res) => {
+  try {
+    const usersModel = require('../schemas/users');
+    const firstDayCurrent = getFirstDayOfCurrentMonth();
+    const firstDayPrev = getFirstDayOfPreviousMonth();
+    const lastDayPrev = getLastDayOfPreviousMonth();
+
+    const currentCount = await usersModel.countDocuments({ date: { $gte: firstDayCurrent } });
+    const prevCount = await usersModel.countDocuments({ date: { $gte: firstDayPrev, $lte: lastDayPrev } });
+
+    let percentageChange = null;
+    if (prevCount === 0) {
+      percentageChange = currentCount === 0 ? 0 : 100;
+    } else {
+      percentageChange = ((currentCount - prevCount) / prevCount) * 100;
+    }
+
+    res.json({ percentageChange });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 8. New towns this month - list
+router.get('/newTownsThisMonth', async (req, res) => {
+  try {
+    const firstDay = getFirstDayOfCurrentMonth();
+    const towns = await require('../schemas/townHalls').countDocuments({ created_at: { $gte: firstDay } });
+    res.json(towns);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 9. New light points this month - list
+router.get('/newLightPointsThisMonth', async (req, res) => {
+  try {
+    const firstDay = getFirstDayOfCurrentMonth();
+    const lightPoints = await require('../schemas/lightPoints').countDocuments({ data_creazione: { $gte: firstDay } });
+    res.json(lightPoints);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/access-this-month', async (req, res) => {
+  try {
+    const { ids } = req.body; // Array di id come stringhe
+    const firstDay = getFirstDayOfCurrentMonth();
+
+    // Cast degli id a ObjectId
+    const objectIds = ids.map(id => new mongoose.Types.ObjectId(id));
+
+    const result = await AccessLog.aggregate([
+      { 
+        $match: { 
+          timestamp: { $gte: firstDay }, 
+          user: { $in: objectIds },
+          outcome: "SUCCESS"
+        } 
+      },
+      {
+        $group: {
+          _id: "$user",
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+
+    // Mappa gli id che non hanno accessi a 0
+    const counts = ids.reduce((acc, id) => {
+      const found = result.find(r => String(r._id) === id);
+      acc[id] = found ? found.count : 0;
+      return acc;
+    }, {});
+
+    res.json(counts);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;

@@ -7,15 +7,17 @@ const { parse } = require('json2csv');
 const accessLogger = require('../middleware/accessLogger');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
+const { transporter, emailLighting, debugMail } = require('../config/email');
+const { returnHtmlEmail } = require('../utils/emailHelpers');
 
 // User validation
 router.post('/validateUser', async (req, res) => {
     const usrType = req.body.user_type
-    const email = req.body.email
+    const id = req.body.userId
 
-    if (!usrType && !email) return res.status(404).send('Email o tipo non valido');
+    if (!usrType && !id) return res.status(404).send('ID o tipo non valido');
     try{
-        const usr = await users.findOne({email: {$eq: email}} );
+        const usr = await users.findById(id);
         if (!usr) return res.status(400).send('user not found');
         
         usr.is_approved = true;
@@ -23,6 +25,32 @@ router.post('/validateUser', async (req, res) => {
 
         await usr.save();
 
+        try {
+            const {returnHtmlUserValidated} = require('../utils/emailHelpers');
+            const htmlEmail = returnHtmlUserValidated(usr, usrType);
+
+            await transporter.sendMail({
+                from: `LIGHTING MAP - Account validato <${emailLighting}>`,
+                to: usr.email,
+                subject: 'Il tuo account è stato validato',
+                html: htmlEmail,
+                attachments: [
+                    {
+                        filename: 'image-1.png',
+                        path: './email/userValidated/images/image-1.png',
+                        cid: 'image1' // cid for inline image
+                    },
+                    {
+                        filename: 'image-2.png',
+                        path: './email/userValidated/images/image-2.png',
+                        cid: 'image2' // cid for inline image
+                    }
+                ]
+            });
+        } catch (mailErr) {
+            console.log(`Errore invio email validazione: ${mailErr}`);
+            // Non bloccare la risposta se la mail fallisce
+        }
         res.send("Utente validato con successo");
     }catch (e){
         debugDB(e)
@@ -30,6 +58,23 @@ router.post('/validateUser', async (req, res) => {
     }
 });
 
+router.post('/removeUserByID/:id', async (req, res) => {
+    const id = req.params.id
+
+    if (!id) return res.status(404).send('ID non valido');
+
+    try{
+        const usr = await users.findById(id);
+        if (!usr) return res.status(400).send('user not found');
+        
+        await usr.deleteOne();
+
+        res.send('Utente eliminato con successo');
+    }catch (e){
+        debugDB(e);
+        res.status(500).send('errore del server');
+    }
+});
 router.post('/removeUser', async (req, res) => {
     const email = req.body.email
 
@@ -48,13 +93,45 @@ router.post('/removeUser', async (req, res) => {
     }
 });
 
-router.post('/update/modifyUser', async (req, res) => {
-    const email = req.body.email
+// Rate limiting per invio mail di conferma (max 3 richieste/ora per IP)
+const RateLimit = require('express-rate-limit');
 
-    if (!email) return res.status(404).send('Email non valida');
+// Limite per email: max 3 richieste/ora per indirizzo email
+const confirmationLimiter = RateLimit({
+    windowMs: 5 * 60 * 1000, // 5 minuti
+    max: 1,
+    keyGenerator: (req) => req.body.email || req.ip,
+    message: 'Hai raggiunto il limite di richieste per questa email. Riprova più tardi.'
+});
+
+router.post('/send-confirmation', confirmationLimiter, async (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).send('Email richiesta');
+    try {
+        const user = await users.findOne({ email });
+        if (!user) return res.status(404).send('Utente non trovato');
+        if (user.emailVerified) return res.status(400).send('Email già verificata');
+        const { sendConfirmationEmail } = require('../utils/emailHelpers');
+        try{
+            await sendConfirmationEmail(user);
+        }catch(e){
+            res.send(e)
+        }
+        res.send('Email di conferma inviata');
+    } catch (e) {
+        res.status(500).send('Errore invio email');
+    }
+});
+
+
+
+router.post('/update/modifyUser', async (req, res) => {
+    const id = req.body.id
+
+    if (!id) return res.status(404).send('ID non trovato');
 
     try{
-        const usr = await users.findOne({email:{ $eq: email}} );
+        const usr = await users.findById(id);
         if (!usr) return res.status(400).send('user not found');
         
         usr.name = req.body.name;
@@ -138,7 +215,7 @@ router.delete('/removeTownHalls', async (req, res) => {
 
 router.get('/', async function (req, res) {
     try {
-        const usersList = await users.find({});
+        const usersList = await users.find({}).sort({ name: 1 });
         res.json(usersList);
     } catch (err) {
         console.error(err);
@@ -158,7 +235,7 @@ router.get('/getNotValidateUsers', async function (req, res) {
 
 router.get('/:id', async function (req, res) {
     try {
-        const user = await users.findOne({id: req.params.id});
+        const user = await users.findById(req.params.id);
         if (user) {
             res.json(user);
         } else {
@@ -275,5 +352,31 @@ router.get('/:id/lightPointsCount', async function (req, res) {
         res.status(500).send('Errore del server');
     }
 });
+
+
+router.post('/update-user-type', async (req, res) => {
+    const { userId, newUserType } = req.body;
+
+    if (!userId || !newUserType) {
+        return res.status(400).json({ error: 'Missing userId or newUserType' });
+    }
+
+    try {
+        const user = await users.findById(userId);
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        user.user_type = newUserType;
+        user.is_approved = true; 
+        await user.save();
+        res.json({ message: 'User type updated successfully', user });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+
 
 module.exports = router; 

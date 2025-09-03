@@ -40,7 +40,7 @@ app.use(bodyParser.json({limit: "50mb"}));
 const RateLimit = require("express-rate-limit");
 const limiter = RateLimit({
   windowMs: 1 * 60 * 1000, // 1 minute
-  max: 50,
+  max: 500,
 });
 
 app.use(limiter);

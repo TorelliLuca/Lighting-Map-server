@@ -28,7 +28,8 @@ const schema = new Schema({
     tipo: {type: String, default: ""},
     segnalazioni_in_corso:[{type: Schema.Types.ObjectId, ref: "reports"}],
     segnalazioni_risolte:[{type: Schema.Types.ObjectId, ref: "reports"}],
-    operazioni_effettuate: [{type: Schema.Types.ObjectId, ref: "operations"}]   
+    operazioni_effettuate: [{type: Schema.Types.ObjectId, ref: "operations"}]   ,
+    data_creazione: { type: Date, default: Date.now },
 })
 
 //per esportare il modello
