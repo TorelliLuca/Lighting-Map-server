@@ -1,16 +1,21 @@
-const { Schema, model } = require("mongoose")
+const { Schema, model } = require("mongoose");
+const organizations = require("./organizations");
 
 const schema = new Schema({
     name: {type: String, required: true},
     region: {type: String},
     province: {type: String},
+    borders: {type: Schema.Types.ObjectId, ref: "borders"},
     coordinates: {
         lat: {type: Number},
-        lng: {type: Number}
+        lng: {type: Number},
+        type: {type: String, enum: ['Point'], default: 'Point'}
     },
     punti_luce: [{type: Schema.Types.ObjectId, ref: "lightPoints"}],
     created_at: {type: Date, default: Date.now},
-    updated_at: {type: Date, default: Date.now}
+    updated_at: {type: Date, default: Date.now},
+    organization_admin: { type: Schema.Types.ObjectId, ref: 'organizations' },
+    organizations_maintainers: [{ type: Schema.Types.ObjectId, ref: 'organizations' }]
 })
 
 // Middleware to update the "updated_at" field on document updates

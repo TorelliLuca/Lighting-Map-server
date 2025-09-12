@@ -215,7 +215,7 @@ router.delete('/removeTownHalls', async (req, res) => {
 
 router.get('/', async function (req, res) {
     try {
-        const usersList = await users.find({}).sort({ name: 1 });
+        const usersList = await users.find({}).sort({ name: 1 }).collation({ locale: 'it', strength: 2 });;
         res.json(usersList);
     } catch (err) {
         console.error(err);

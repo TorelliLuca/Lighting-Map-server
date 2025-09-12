@@ -28,6 +28,8 @@ const mapsRoutes = require('./routes/maps');
 const accessLogsRoutes = require('./routes/accessLogs');
 const maintenanceRoutes = require('./routes/maintenance');
 const pushRoutes = require('./routes/push');
+const organizationsRoutes = require('./routes/organizations');
+const bordersRoutes = require('./routes/borders');
 
 const app = express();
 
@@ -52,7 +54,7 @@ if (process.env.NODE_ENV === 'production') {
         origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : [
             ''
         ],
-        methods: ['GET', 'POST', 'DELETE', 'OPTIONS', 'PATCH'],
+        methods: ['GET', 'POST', 'DELETE', 'PUT', 'OPTIONS', 'PATCH'],
         allowedHeaders: ['Authorization', 'Content-Type'],
         credentials: false
     };
@@ -60,7 +62,7 @@ if (process.env.NODE_ENV === 'production') {
     // In dev, allow all origins
     corsOptions = {
         origin: true,
-        methods: ['GET', 'POST', 'DELETE', 'OPTIONS', 'PATCH'],
+        methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
         allowedHeaders: ['Authorization', 'Content-Type'],
         credentials: false
     };
@@ -116,6 +118,10 @@ app.use('/api/access-logs', accessLogsRoutes);
 
 // Push notifications routes
 app.use('/api/push', pushRoutes);
+
+app.use('/organizations', organizationsRoutes);
+
+app.use('/borders', bordersRoutes);
 
 // Start server
 const PORT = process.env.PORT || 3000;

@@ -74,7 +74,8 @@ router.post('/addOperation', async (req, res) => {
             note: req.body.note,
             report_to_solve: report? report: fakeReport,
             is_solved: req.body.is_solved,
-            operation_date: req.body.date
+            operation_date: req.body.date,
+            maintenance_type: req.body.maintenance_type
         });
 
         if (req.body.is_solved && report) {

@@ -48,7 +48,8 @@ router.post('/', async (req, res) => {
             coordinates: {
                 lat: req.body.coordinates?.lat,
                 lng: req.body.coordinates?.lng
-            }
+            },
+            borders: req.body.borders
         }], { session });
 
         
@@ -550,7 +551,7 @@ router.patch('/lightPoints/update/:_id', async (req, res) => {
 
 router.get('/', async (req, res) => {
     try {
-        const thList = await townHalls.find({}).sort({ name: 1 });
+        const thList = await townHalls.find({}).sort({ name: 1 }).collation({ locale: 'it', strength: 2 });;
 
         const transformedList = thList.map(th => {
             const thObject = th.toObject(); // Converte il documento Mongoose in un oggetto JavaScript

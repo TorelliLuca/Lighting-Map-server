@@ -13,7 +13,8 @@ const schema = new Schema({
     is_approved: {type: Boolean, default: false},
     emailVerified: {type: Boolean, default: false},
     resetPasswordToken: {type: String, default: null},
-    resetPasswordExpires: {type: Date, default: null}
+    resetPasswordExpires: {type: Date, default: null},
+    id_organization: {type: Schema.Types.ObjectId, ref: 'organizations', default: null},
 })
 
 schema.pre('save', async function(next) {

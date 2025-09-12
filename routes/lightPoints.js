@@ -38,6 +38,7 @@ router.post('/create', async (req, res) => {
     if(!townHall) {
         return res.status(404).send("Comune non trovato.");
     }
+    console.log(lpToCreate);
 
     const session = await mongoose.startSession();
     session.startTransaction();

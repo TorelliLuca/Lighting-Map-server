@@ -127,7 +127,8 @@ router.post('/login', async function (req, res) {
                 email: user.email,
                 is_approved: user.is_approved,
                 user_type: user.user_type,
-                town_halls_list: user.town_halls_list
+                town_halls_list: user.town_halls_list,
+                id_organization: user.id_organization
             },
             token
         });
