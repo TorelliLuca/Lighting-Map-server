@@ -319,4 +319,52 @@ router.post('/access-this-month', async (req, res) => {
   }
 });
 
+router.post('/last-login', async (req, res)=> {
+  try {
+    const { userIds } = req.body;
+
+    // 1. Validazione dell'input
+    if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
+      return res.status(400).json({ error: 'Il corpo della richiesta deve contenere un array non vuoto di userIds.' });
+    }
+
+    // 2. Converte le stringhe in ObjectId di Mongoose
+    const validUserIds = userIds.map(id => new mongoose.Types.ObjectId(id));
+
+    // 3. Pipeline di aggregazione di MongoDB
+    const latestLogins = await AccessLog.aggregate([
+      // Fase 1: Filtra i documenti in base agli ID utente e al tipo di azione 'LOGIN'
+      {
+        $match: {
+          user: { $in: validUserIds },
+          action: 'LOGIN'
+        }
+      },
+      // Fase 2: Raggruppa i documenti per ID utente
+      {
+        $group: {
+          _id: '$user',
+          latestLogin: { $max: '$timestamp' } // Trova il timestamp più recente
+        }
+      },
+      // Fase 3 (opzionale): Proietta i campi desiderati per la risposta finale
+      {
+        $project: {
+          _id: 0, // Escludi l'ID interno dell'aggregazione
+          userId: '$_id',
+          latestLogin: '$latestLogin'
+        }
+      }
+    ]);
+
+    // 4. Invia la risposta
+    res.status(200).json(latestLogins);
+
+  } catch (error) {
+    // Gestione degli errori
+    console.error('Errore durante l\'aggregazione per l\'ultimo login:', error);
+    res.status(500).json({ error: 'Errore interno del server.' });
+  }
+});
+
 module.exports = router;
