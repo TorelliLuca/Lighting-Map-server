@@ -131,3 +131,5 @@ dist
 .yarn/install-state.gz
 .pnp.*
 generateVAPIDKeys.js
+backup.js
+backup*/

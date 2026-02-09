@@ -52,7 +52,7 @@ router.post('/send-email-to-user/lightPointReported', async(req, res) => {
     if (!th) res.status(404).send('Comune non trovato, impossibile inviare la mail');
 
     const destination = await users.find({town_halls_list: th._id,
-        user_type: { $in: ['ADMINISTRATOR', 'SUPER_ADMIN']}}).select('email -_id')
+        user_type: { $in: ['ADMINISTRATOR', 'SUPER_ADMIN', 'MAINTAINER']}}).select('email -_id')
     const destinationEmail = destination.map(userEmail => userEmail.email)
     
     debugMail(destinationEmail);
@@ -99,7 +99,7 @@ router.post('/send-email-to-user/reportSolved', async(req, res) => {
     if (!th) res.status(404).send('Comune non trovato, impossibile inviare la mail');
 
     const destination = await users.find({town_halls_list: th._id,
-        user_type: { $in: ['ADMINISTRATOR', 'SUPER_ADMIN']}}).select('email -_id')
+        user_type: { $in: ['ADMINISTRATOR', 'SUPER_ADMIN', 'MAINTAINER']}}).select('email -_id')
     const destinationEmail = destination.map(userEmail => userEmail.email)
     debugMail(destinationEmail);
 
