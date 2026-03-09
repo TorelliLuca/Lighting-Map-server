@@ -127,6 +127,7 @@ router.post('/send-confirmation', confirmationLimiter, async (req, res) => {
 
 router.post('/update/modifyUser', async (req, res) => {
     const id = req.body.id
+    const userData = req.body.userData
 
     if (!id) return res.status(404).send('ID non trovato');
 
@@ -134,12 +135,12 @@ router.post('/update/modifyUser', async (req, res) => {
         const usr = await users.findById(id);
         if (!usr) return res.status(400).send('user not found');
         
-        usr.name = req.body.name;
-        usr.surname = req.body.surname;
-        usr.user_type = req.body.user_type; 
+        usr.name = userData.name;
+        usr.surname = userData.surname;
+        usr.user_type = userData.user_type; 
         
-        if (req.body.password) {
-            usr.password = req.body.password;
+        if (userData.password) {
+            usr.password = userData.password;
         }
 
         await usr.save();
