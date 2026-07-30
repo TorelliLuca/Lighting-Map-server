@@ -7,6 +7,7 @@ const { returnHtmlEmailAdmin } = require('../utils/emailHelpers');
 const accessLogger = require('../middleware/accessLogger');
 const logAccess = require('../utils/accessLogger');
 const router = express.Router();
+const borders = require("./../schemas/borders");
 
 // Rate limiting per invio mail di reset password (max 1 richiesta/30s per email)
 const RateLimit = require('express-rate-limit');
@@ -171,7 +172,9 @@ router.post('/addPendingUser', async function (req, res) {
             email: req.body.email,
             password: req.body.password,
             is_approved: false,
-            emailVerified: false
+            emailVerified: false,
+            requested_townhall: req.body.requested_townhall,
+            requested_townhall_notes: req.body.requested_townhall_notes
         });
         await newUser.save();
 
@@ -238,6 +241,19 @@ router.post('/send-email-to-user/userNeedValidation', async(req, res) => {
     try {
         let info = await transporter.sendMail(mailOptions);
         debugMail('Email sent: ' + info.response);
+        const { createNotificationsForEmails, safeNotify } = require('../utils/notificationHelpers');
+        await safeNotify(() =>
+            createNotificationsForEmails(process.env.ADMIN_EMAIL, {
+                title: 'Nuova richiesta di autenticazione',
+                body: `${username} ${req.body.user.surname} ha richiesto l'accesso a Lighting-map.`,
+                type: 'USER_NEED_VALIDATION',
+                url: '/dashboard',
+                meta: {
+                    name: username,
+                    surname: req.body.user.surname,
+                },
+            })
+        );
         res.status(200).send('Email inviata con successo');
     } catch (error) {
         debugMail(error);
@@ -245,6 +261,30 @@ router.post('/send-email-to-user/userNeedValidation', async(req, res) => {
     }
 });
 
+router.get('/suggest-townhall-name/prefix', async (req, res) => {
+  const { prefix } = req.query;
+
+  // Controllo sulla validità dell'input
+  if (!prefix || typeof prefix !== 'string' || prefix.length < 2) {
+    return res.status(400).json({ error: 'Fornire un prefisso valido di almeno 2 caratteri.' });
+  }
+
+  try {
+    // Utilizziamo un'espressione regolare per la ricerca case-insensitive e che inizia per il prefisso
+    const regex = new RegExp(`^${prefix}`, 'i');
+    
+    // Proiezione: recuperiamo solo i campi essenziali per alleggerire il payload
+    const comuni = await borders.find(
+      { 'properties.comune': { $regex: regex } },
+      { 'properties.comune': 1, 'properties.pro_com_t': 1, '_id': 1 }
+    ).limit(5); // Limita i risultati per prevenire risposte troppo grandi
+
+    res.json(comuni);
+  } catch (err) {
+    console.error('Errore durante la ricerca dei comuni:', err);
+    res.status(500).json({ error: 'Errore interno del server.' });
+  }
+});
 
 
 module.exports = router; 

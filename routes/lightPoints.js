@@ -1,9 +1,100 @@
 const express = require('express');
 const lightPoints = require('../schemas/lightPoints');
 const townHalls = require('../schemas/townHalls');
+const users = require('../schemas/users');
 const mongoose = require('mongoose');
 
 const router = express.Router();
+
+const BATCH_UPDATE_MAX = 500;
+
+function parseCoord(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const n = typeof value === 'number' ? value : parseFloat(String(value).replace(',', '.'));
+    return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Aggiorna lat/lng di più punti luce in un'unica richiesta (strumento lazo).
+ * Body: { updates: [{ _id, lat, lng }, ...] }
+ * Solo SUPER_ADMIN.
+ */
+router.patch('/updateBatch', async (req, res) => {
+    try {
+        const requester = await users.findById(req.user.id).select('user_type');
+        if (!requester || requester.user_type !== 'SUPER_ADMIN') {
+            return res.status(403).json({ error: 'Accesso negato, non possiedi i diritti necessari!' });
+        }
+
+        const { updates } = req.body || {};
+        if (!Array.isArray(updates) || updates.length === 0) {
+            return res.status(400).json({ error: 'Body non valido: richiesto updates (array non vuoto).' });
+        }
+        if (updates.length > BATCH_UPDATE_MAX) {
+            return res.status(400).json({
+                error: `Troppi aggiornamenti in una sola richiesta (max ${BATCH_UPDATE_MAX}).`
+            });
+        }
+
+        const ops = [];
+        const invalid = [];
+
+        for (const item of updates) {
+            const id = item?._id;
+            if (!id || !mongoose.Types.ObjectId.isValid(id)) {
+                invalid.push({ _id: id, reason: 'id non valido' });
+                continue;
+            }
+            const lat = parseCoord(item.lat);
+            const lng = parseCoord(item.lng);
+            if (lat === null || lng === null || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+                invalid.push({ _id: id, reason: 'coordinate non valide' });
+                continue;
+            }
+            ops.push({
+                updateOne: {
+                    filter: { _id: id },
+                    update: {
+                        $set: {
+                            lat: String(lat),
+                            lng: String(lng)
+                        }
+                    }
+                }
+            });
+        }
+
+        if (ops.length === 0) {
+            return res.status(400).json({
+                error: 'Nessun aggiornamento valido.',
+                failed: invalid
+            });
+        }
+
+        const result = await lightPoints.bulkWrite(ops, { ordered: false });
+        const matched = result.matchedCount ?? 0;
+        const modified = result.modifiedCount ?? 0;
+
+        if (invalid.length > 0) {
+            return res.status(207).json({
+                updated: modified,
+                matched,
+                failed: invalid,
+                message: `${modified} punti aggiornati, ${invalid.length} non validi.`
+            });
+        }
+
+        res.json({
+            updated: modified,
+            matched,
+            failed: [],
+            message: `${modified} punti luce aggiornati con successo.`
+        });
+    } catch (error) {
+        console.error('Errore updateBatch:', error);
+        res.status(500).json({ error: 'Errore del server: ' + error.message });
+    }
+});
 
 router.post('/update/:_id', async (req, res) => {
     const type = req.body.user_type;

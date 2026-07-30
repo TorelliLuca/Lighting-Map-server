@@ -3,6 +3,11 @@ const townHalls = require('../schemas/townHalls');
 const users = require('../schemas/users');
 const { transporter, emailLighting, debugMail } = require('../config/email');
 const { returnHtmlEmail, returnHtmlEmailAfterReport, returnHtmlEmailAfterOperation } = require('../utils/emailHelpers');
+const {
+  createNotifications,
+  createNotificationsForEmails,
+  safeNotify,
+} = require('../utils/notificationHelpers');
 
 const router = express.Router();
 
@@ -40,6 +45,14 @@ router.post('/send-email-to-user/isApproved', async(req, res) => {
     try {
         let info = await transporter.sendMail(mailOptions);
         debugMail('Email sent: ' + info.response);
+        await safeNotify(() =>
+            createNotificationsForEmails(req.body.to, {
+                title: 'Account abilitato',
+                body: 'La tua autenticazione su Lighting-map è stata abilitata.',
+                type: 'ACCOUNT_APPROVED',
+                url: '/dashboard',
+            })
+        );
         res.status(200).send('Email inviata con successo');
     } catch (error) {
         debugMail(error);
@@ -49,22 +62,23 @@ router.post('/send-email-to-user/isApproved', async(req, res) => {
 
 router.post('/send-email-to-user/lightPointReported', async(req, res) => {
     const th = await townHalls.findOne({name: {$eq: req.body.name}});
-    if (!th) res.status(404).send('Comune non trovato, impossibile inviare la mail');
+    if (!th) return res.status(404).send('Comune non trovato, impossibile inviare la mail');
 
     const destination = await users.find({town_halls_list: th._id,
-        user_type: { $in: ['ADMINISTRATOR', 'SUPER_ADMIN', 'MAINTAINER']}}).select('email -_id')
+        user_type: { $in: ['ADMINISTRATOR', 'SUPER_ADMIN', 'MAINTAINER']}}).select('email')
     const destinationEmail = destination.map(userEmail => userEmail.email)
+    const destinationIds = destination.map((u) => u._id);
     
     debugMail(destinationEmail);
 
-    const username = req.body.user.name
+    const numeroPalo = req.body.light_point?.numero_palo;
     const htmlEmail = returnHtmlEmailAfterReport(req.body.user, req.body.date, req.body.name,req.body.light_point ,req.body.report)
     
     for (let email of destinationEmail) {
         var mailOptions = {
             from: `LIGHTING MAP - Segnalazione guasti<${emailLighting}>`,
             to: email,
-            subject: `Aperta segnalazione sul punto ${req.body.light_point.numero_palo}, ${req.body.name}`,
+            subject: `Aperta segnalazione sul punto ${numeroPalo}, ${req.body.name}`,
             html: htmlEmail,
             attachments: [
                 {
@@ -91,26 +105,42 @@ router.post('/send-email-to-user/lightPointReported', async(req, res) => {
             debugMail(`Error sending email to ${email}: ` + error);
         }
     }
+
+    await safeNotify(() =>
+        createNotifications(destinationIds, {
+            title: `Segnalazione su punto ${numeroPalo}`,
+            body: `${req.body.report?.report_type || 'Guasto'} — ${req.body.name}${req.body.report?.description ? `: ${req.body.report.description}` : ''}`,
+            type: 'REPORT_CREATED',
+            url: '/dashboard',
+            meta: {
+                townHallName: req.body.name,
+                numeroPalo,
+                reportType: req.body.report?.report_type,
+            },
+        })
+    );
+
     res.status(200).send('Emails sent');
 });
 
 router.post('/send-email-to-user/reportSolved', async(req, res) => {
     const th = await townHalls.findOne({name: {$eq: req.body.name}});
-    if (!th) res.status(404).send('Comune non trovato, impossibile inviare la mail');
+    if (!th) return res.status(404).send('Comune non trovato, impossibile inviare la mail');
 
     const destination = await users.find({town_halls_list: th._id,
-        user_type: { $in: ['ADMINISTRATOR', 'SUPER_ADMIN', 'MAINTAINER']}}).select('email -_id')
+        user_type: { $in: ['ADMINISTRATOR', 'SUPER_ADMIN', 'MAINTAINER']}}).select('email')
     const destinationEmail = destination.map(userEmail => userEmail.email)
+    const destinationIds = destination.map((u) => u._id);
     debugMail(destinationEmail);
 
-    const username = req.body.user.name
+    const numeroPalo = req.body.light_point?.numero_palo;
     const htmlEmail = returnHtmlEmailAfterOperation(req.body.user, req.body.date, req.body.name,req.body.light_point ,req.body.operation)
     
     for (let email of destinationEmail) {
         var mailOptions = {
             from: `LIGHTING MAP - Segnalazione guasti<${emailLighting}>`,
             to: email,
-            subject: `Operazione effettuata sul punto ${req.body.light_point.numero_palo}, ${req.body.name}`,
+            subject: `Operazione effettuata sul punto ${numeroPalo}, ${req.body.name}`,
             html: htmlEmail,
             attachments: [
                 {
@@ -152,7 +182,22 @@ router.post('/send-email-to-user/reportSolved', async(req, res) => {
             debugMail(`Error sending email to ${email}: ` + error);
         }
     }
+
+    await safeNotify(() =>
+        createNotifications(destinationIds, {
+            title: `Operazione su punto ${numeroPalo}`,
+            body: `${req.body.operation?.operation_type || 'Intervento'} — ${req.body.name}${req.body.operation?.description ? `: ${req.body.operation.description}` : ''}`,
+            type: 'REPORT_SOLVED',
+            url: '/dashboard',
+            meta: {
+                townHallName: req.body.name,
+                numeroPalo,
+                operationType: req.body.operation?.operation_type,
+            },
+        })
+    );
+
     res.status(200).send('Emails sent');
 });
 
-module.exports = router; 
+module.exports = router;

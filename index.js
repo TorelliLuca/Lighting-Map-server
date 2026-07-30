@@ -30,6 +30,7 @@ const maintenanceRoutes = require('./routes/maintenance');
 const pushRoutes = require('./routes/push');
 const organizationsRoutes = require('./routes/organizations');
 const bordersRoutes = require('./routes/borders');
+const notificationsRoutes = require('./routes/notifications');
 
 const app = express();
 
@@ -118,6 +119,9 @@ app.use('/api/access-logs', accessLogsRoutes);
 
 // Push notifications routes
 app.use('/api/push', pushRoutes);
+
+// In-app notifications
+app.use('/api/notifications', notificationsRoutes);
 
 app.use('/organizations', organizationsRoutes);
 

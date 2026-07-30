@@ -2,12 +2,71 @@ const express = require('express');
 const AccessLog = require('../schemas/accessLog');
 const router = express.Router();
 const mongoose = require('mongoose');
+const usersModel = require('../schemas/users');
+const townHallsModel = require('../schemas/townHalls');
+const lightPointsModel = require('../schemas/lightPoints');
+
+function normalizeDateRange(startDateRaw, endDateRaw) {
+  if (!startDateRaw && !endDateRaw) {
+    return null;
+  }
+
+  const range = {};
+
+  if (startDateRaw) {
+    const startDate = new Date(startDateRaw);
+    if (Number.isNaN(startDate.getTime())) {
+      return { error: 'startDate non valida' };
+    }
+    startDate.setHours(0, 0, 0, 0);
+    range.$gte = startDate;
+  }
+
+  if (endDateRaw) {
+    const endDate = new Date(endDateRaw);
+    if (Number.isNaN(endDate.getTime())) {
+      return { error: 'endDate non valida' };
+    }
+    endDate.setHours(23, 59, 59, 999);
+    range.$lte = endDate;
+  }
+
+  if (range.$gte && range.$lte && range.$gte > range.$lte) {
+    return { error: 'startDate deve essere precedente o uguale a endDate' };
+  }
+
+  return range;
+}
+
+function buildAccessLogMatch(baseMatch, startDateRaw, endDateRaw) {
+  const dateRange = normalizeDateRange(startDateRaw, endDateRaw);
+  if (dateRange?.error) {
+    return { error: dateRange.error };
+  }
+
+  const match = { ...baseMatch };
+  if (dateRange) {
+    match.timestamp = dateRange;
+  }
+
+  return { match };
+}
 
 // 1. Utenti unici per mese
 router.get('/stats/monthly-users', async (req, res) => {
   try {
+    const { match, error } = buildAccessLogMatch(
+      { action: "LOGIN", outcome: "SUCCESS", user: { $ne: null } },
+      req.query.startDate,
+      req.query.endDate
+    );
+
+    if (error) {
+      return res.status(400).json({ error });
+    }
+
     const result = await AccessLog.aggregate([
-  { $match: { action: "LOGIN", outcome: "SUCCESS", user: { $ne: null } } },
+  { $match: match },
   {
     $group: {
       _id: {
@@ -63,7 +122,13 @@ router.get('/stats/monthly-users', async (req, res) => {
 // 2. Azioni più frequenti
 router.get('/stats/top-actions', async (req, res) => {
   try {
+    const { match, error } = buildAccessLogMatch({}, req.query.startDate, req.query.endDate);
+    if (error) {
+      return res.status(400).json({ error });
+    }
+
     const result = await AccessLog.aggregate([
+      { $match: match },
       { $group: { _id: "$action", count: { $sum: 1 } } },
       { $sort: { count: -1 } },
       { $limit: 10 }
@@ -77,8 +142,17 @@ router.get('/stats/top-actions', async (req, res) => {
 // 3. Utente più attivo
 router.get('/stats/top-user', async (req, res) => {
   try {
+    const { match, error } = buildAccessLogMatch(
+      { user: { $ne: null } },
+      req.query.startDate,
+      req.query.endDate
+    );
+    if (error) {
+      return res.status(400).json({ error });
+    }
+
     const result = await AccessLog.aggregate([
-      { $match: { user: { $ne: null } } },
+      { $match: match },
       { $group: { _id: "$user", count: { $sum: 1 } } },
       { $sort: { count: -1 } },
       { $limit: 1 },
@@ -93,7 +167,7 @@ router.get('/stats/top-user', async (req, res) => {
       { $unwind: "$userInfo" },
       {
         $project: {
-          _id: 0,
+          _id: "$userInfo._id",
           name: "$userInfo.name",
           surname: "$userInfo.surname",
           count: 1
@@ -109,8 +183,17 @@ router.get('/stats/top-user', async (req, res) => {
 // 4. Trend annuale degli accessi
 router.get('/stats/yearly-trend', async (req, res) => {
   try {
+    const { match, error } = buildAccessLogMatch(
+      { action: "LOGIN", outcome: "SUCCESS", user: { $ne: null } },
+      req.query.startDate,
+      req.query.endDate
+    );
+    if (error) {
+      return res.status(400).json({ error });
+    }
+
     const result = await AccessLog.aggregate([
-      { $match: { action: "LOGIN", outcome: "SUCCESS", user: { $ne: null } } },
+      { $match: match },
       {
         $group: {
           _id: { year: { $year: "$timestamp" }, month: { $month: "$timestamp" } },
@@ -136,8 +219,17 @@ router.get('/stats/yearly-trend', async (req, res) => {
 // 5. Richieste fallite
 router.get('/stats/failed-requests', async (req, res) => {
   try {
+    const { match, error } = buildAccessLogMatch(
+      { outcome: "FAILURE" },
+      req.query.startDate,
+      req.query.endDate
+    );
+    if (error) {
+      return res.status(400).json({ error });
+    }
+
     const result = await AccessLog.aggregate([
-      { $match: { outcome: "FAILURE" } },
+      { $match: match },
       { $group: { _id: "$action", count: { $sum: 1 } } },
       { $sort: { count: -1 } }
     ]);
@@ -148,8 +240,17 @@ router.get('/stats/failed-requests', async (req, res) => {
 });
 router.get('/stats/failed-requests-details/:action', async (req, res) => {
   try {
+    const { match, error } = buildAccessLogMatch(
+      { outcome: "FAILURE", action: req.params.action },
+      req.query.startDate,
+      req.query.endDate
+    );
+    if (error) {
+      return res.status(400).json({ error });
+    }
+
     const result = await AccessLog.aggregate([
-      { $match: { outcome: "FAILURE", action: req.params.action } },
+      { $match: match },
        {
         $lookup: {
           from: 'users', 
@@ -175,7 +276,15 @@ router.get('/stats/failed-requests-details/:action', async (req, res) => {
 // 6. Heatmap delle azioni
 router.get('/stats/action-heatmap', async (req, res) => {
   try {
+    const { match, error } = buildAccessLogMatch({}, req.query.startDate, req.query.endDate);
+    if (error) {
+      return res.status(400).json({ error });
+    }
+
     const result = await AccessLog.aggregate([
+      {
+        $match: match
+      },
       {
         $group: {
           _id: {
@@ -228,8 +337,13 @@ function getLastDayOfPreviousMonth() {
 // 7. New users this month - count
 router.get('/newUsersThisMonth', async (req, res) => {
   try {
-    const firstDay = getFirstDayOfCurrentMonth();
-    const count = await require('../schemas/users').countDocuments({ date: { $gte: firstDay } });
+    const dateRange = normalizeDateRange(req.query.startDate, req.query.endDate);
+    if (dateRange?.error) {
+      return res.status(400).json({ error: dateRange.error });
+    }
+
+    const filter = dateRange ? { date: dateRange } : { date: { $gte: getFirstDayOfCurrentMonth() } };
+    const count = await usersModel.countDocuments(filter);
     res.json({ newUsersThisMonth: count });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -239,7 +353,16 @@ router.get('/newUsersThisMonth', async (req, res) => {
 // 10. Percentage of new users compared to previous month
 router.get('/newUsersPercentageChange', async (req, res) => {
   try {
-    const usersModel = require('../schemas/users');
+    const dateRange = normalizeDateRange(req.query.startDate, req.query.endDate);
+    if (dateRange?.error) {
+      return res.status(400).json({ error: dateRange.error });
+    }
+
+    if (dateRange) {
+      const currentCount = await usersModel.countDocuments({ date: dateRange });
+      return res.json({ percentageChange: currentCount });
+    }
+
     const firstDayCurrent = getFirstDayOfCurrentMonth();
     const firstDayPrev = getFirstDayOfPreviousMonth();
     const lastDayPrev = getLastDayOfPreviousMonth();
@@ -263,8 +386,13 @@ router.get('/newUsersPercentageChange', async (req, res) => {
 // 8. New towns this month - list
 router.get('/newTownsThisMonth', async (req, res) => {
   try {
-    const firstDay = getFirstDayOfCurrentMonth();
-    const towns = await require('../schemas/townHalls').countDocuments({ created_at: { $gte: firstDay } });
+    const dateRange = normalizeDateRange(req.query.startDate, req.query.endDate);
+    if (dateRange?.error) {
+      return res.status(400).json({ error: dateRange.error });
+    }
+
+    const filter = dateRange ? { created_at: dateRange } : { created_at: { $gte: getFirstDayOfCurrentMonth() } };
+    const towns = await townHallsModel.countDocuments(filter);
     res.json(towns);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -274,8 +402,13 @@ router.get('/newTownsThisMonth', async (req, res) => {
 // 9. New light points this month - list
 router.get('/newLightPointsThisMonth', async (req, res) => {
   try {
-    const firstDay = getFirstDayOfCurrentMonth();
-    const lightPoints = await require('../schemas/lightPoints').countDocuments({ data_creazione: { $gte: firstDay } });
+    const dateRange = normalizeDateRange(req.query.startDate, req.query.endDate);
+    if (dateRange?.error) {
+      return res.status(400).json({ error: dateRange.error });
+    }
+
+    const filter = dateRange ? { data_creazione: dateRange } : { data_creazione: { $gte: getFirstDayOfCurrentMonth() } };
+    const lightPoints = await lightPointsModel.countDocuments(filter);
     res.json(lightPoints);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -284,16 +417,21 @@ router.get('/newLightPointsThisMonth', async (req, res) => {
 
 router.post('/access-this-month', async (req, res) => {
   try {
-    const { ids } = req.body; // Array di id come stringhe
-    const firstDay = getFirstDayOfCurrentMonth();
+    const { ids, startDate, endDate } = req.body; // Array di id come stringhe
+    const dateRange = normalizeDateRange(startDate, endDate);
+    if (dateRange?.error) {
+      return res.status(400).json({ error: dateRange.error });
+    }
 
     // Cast degli id a ObjectId
     const objectIds = ids.map(id => new mongoose.Types.ObjectId(id));
 
+    const timestampFilter = dateRange || { $gte: getFirstDayOfCurrentMonth() };
+
     const result = await AccessLog.aggregate([
       { 
         $match: { 
-          timestamp: { $gte: firstDay }, 
+          timestamp: timestampFilter,
           user: { $in: objectIds },
           outcome: "SUCCESS"
         } 
@@ -321,7 +459,7 @@ router.post('/access-this-month', async (req, res) => {
 
 router.post('/last-login', async (req, res)=> {
   try {
-    const { userIds } = req.body;
+    const { userIds, startDate, endDate } = req.body;
 
     // 1. Validazione dell'input
     if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
@@ -332,13 +470,23 @@ router.post('/last-login', async (req, res)=> {
     const validUserIds = userIds.map(id => new mongoose.Types.ObjectId(id));
 
     // 3. Pipeline di aggregazione di MongoDB
+    const dateRange = normalizeDateRange(startDate, endDate);
+    if (dateRange?.error) {
+      return res.status(400).json({ error: dateRange.error });
+    }
+
+    const loginMatch = {
+      user: { $in: validUserIds },
+      action: 'LOGIN'
+    };
+    if (dateRange) {
+      loginMatch.timestamp = dateRange;
+    }
+
     const latestLogins = await AccessLog.aggregate([
       // Fase 1: Filtra i documenti in base agli ID utente e al tipo di azione 'LOGIN'
       {
-        $match: {
-          user: { $in: validUserIds },
-          action: 'LOGIN'
-        }
+        $match: loginMatch
       },
       // Fase 2: Raggruppa i documenti per ID utente
       {

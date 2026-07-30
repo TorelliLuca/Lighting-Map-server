@@ -15,13 +15,23 @@ router.post('/validateUser', async (req, res) => {
     const usrType = req.body.user_type
     const id = req.body.userId
 
-    if (!usrType && !id) return res.status(404).send('ID o tipo non valido');
+    if (!id) return res.status(404).send('ID non valido');
     try{
         const usr = await users.findById(id);
         if (!usr) return res.status(400).send('user not found');
         
         usr.is_approved = true;
-        usr.user_type = usrType;
+        usr.user_type = usrType || usr.user_type;
+
+        // If a townhall id was provided, find it and link it
+        const townHallId = req.body.townHallId
+        if (townHallId) {
+            const townHall = await townHalls.findById(townHallId);
+            debugDB(`Linking townhall id: ${townHallId} -> found: ${townHall ? townHall.name : 'null'}`);
+            if (townHall && !usr.town_halls_list.some(t => t.equals(townHall._id))) {
+                usr.town_halls_list.push(townHall._id);
+            }
+        }
 
         await usr.save();
 
@@ -47,6 +57,18 @@ router.post('/validateUser', async (req, res) => {
                     }
                 ]
             });
+
+            const { createNotification, safeNotify } = require('../utils/notificationHelpers');
+            await safeNotify(() =>
+                createNotification({
+                    userId: usr._id,
+                    title: 'Account validato',
+                    body: 'Il tuo account è stato validato. Puoi accedere a LightingMap.',
+                    type: 'USER_VALIDATED',
+                    url: '/dashboard',
+                    meta: { userType: usrType },
+                })
+            );
         } catch (mailErr) {
             console.log(`Errore invio email validazione: ${mailErr}`);
             // Non bloccare la risposta se la mail fallisce
@@ -141,6 +163,15 @@ router.post('/update/modifyUser', async (req, res) => {
         
         if (userData.password) {
             usr.password = userData.password;
+        }
+
+        // If a townhall id was provided, find it and link it
+        const townHallId = req.body.townHallId
+        if (townHallId) {
+            const townHall = await townHalls.findById(townHallId);
+            if (townHall && !usr.town_halls_list.some(t => t.equals(townHall._id))) {
+                usr.town_halls_list.push(townHall._id);
+            }
         }
 
         await usr.save();

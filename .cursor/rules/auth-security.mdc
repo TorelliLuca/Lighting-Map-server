@@ -1,0 +1,22 @@
+---
+description: "Autenticazione, ruoli e sicurezza"
+globs: ["middleware/**/*.js", "routes/auth.js", "routes/users.js"]
+alwaysApply: false
+---
+
+- Password: mai in chiaro, sempre bcrypt.hash/bcrypt.compare come già fatto
+  in auth.js. Non abbassare il salt round esistente.
+- JWT: firma e verifica solo tramite JWT_SECRET da env, mai hardcoded.
+  Il middleware auth.js è il punto unico di verifica token — non duplicare
+  la logica di verifica JWT in altre route, importa e riusa il middleware.
+- Ruoli utente attesi nel sistema: Super Amministratore, Amministratore,
+  Manutentore. Ogni nuova route protetta deve dichiarare esplicitamente
+  quali ruoli sono autorizzati, non limitarti a "utente autenticato" se
+  l'azione è sensibile (es. CRUD su comuni, gestione utenti).
+- Rate limiting: le route di login/registrazione devono restare dietro
+  express-rate-limit già configurato — se aggiungi nuovi endpoint di auth,
+  applica lo stesso limiter.
+- Validazione input: non c'è una libreria di validazione dedicata nel
+  progetto (niente Joi/express-validator) — valida manualmente i campi
+  critici (email, ObjectId di Mongoose) prima di interrogare il DB, per
+  evitare CastError non gestiti e injection nei filtri Mongoose.

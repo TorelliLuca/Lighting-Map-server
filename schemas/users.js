@@ -15,6 +15,8 @@ const schema = new Schema({
     resetPasswordToken: {type: String, default: null},
     resetPasswordExpires: {type: Date, default: null},
     id_organization: {type: Schema.Types.ObjectId, ref: 'organizations', default: null},
+    requested_townhall: {type: String, default: null},
+    requested_townhall_notes: {type: String, default: null}
 })
 
 schema.pre('save', async function(next) {

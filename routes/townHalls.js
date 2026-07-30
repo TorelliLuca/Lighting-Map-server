@@ -8,6 +8,7 @@ const XLSX = require('xlsx');
 const { transporter, emailLighting, debugMail } = require('../config/email');
 const { returnHtmlEmailUploadSuccess, returnHtmlEmailUploadError } = require('../utils/emailHelpers');
 const { toCsvItalianStyle, normalizeKeysToLowerCase, isEmptyLightPoint, compareNumeroPalo } = require('../utils/utility');
+const { createNotificationsForEmails, safeNotify } = require('../utils/notificationHelpers');
 
 const router = express.Router();
 
@@ -17,6 +18,113 @@ function chunkArray(array, size) {
         result.push(array.slice(i, i + size));
     }
     return result;
+}
+
+/** Invio email upload/update + notifica in-app allo stesso destinatario. */
+async function sendMailAndNotify(mailOptions, { type, townHallName } = {}) {
+    await transporter.sendMail(mailOptions);
+    const isError = type === 'UPLOAD_ERROR';
+    await safeNotify(() =>
+        createNotificationsForEmails(mailOptions.to, {
+            title: mailOptions.subject || (isError ? 'Errore caricamento' : 'Caricamento completato'),
+            body: isError
+                ? `Si è verificato un errore sul comune ${townHallName || ''}.`
+                : `Operazione completata sul comune ${townHallName || ''}.`,
+            type: type || 'GENERIC',
+            meta: { townHallName: townHallName || null },
+        })
+    );
+}
+
+/** Populate nested usato da GET /:name e dalle pagine lightPoints */
+const LIGHT_POINT_FULL_POPULATE = [
+    {
+        path: 'segnalazioni_in_corso',
+        model: 'reports',
+        populate: {
+            path: 'user_creator_id',
+            model: 'users',
+            select: 'name surname email'
+        }
+    },
+    {
+        path: 'segnalazioni_risolte',
+        model: 'reports',
+        populate: [{
+            path: 'user_creator_id',
+            model: 'users',
+            select: 'name surname email'
+        }, {
+            path: 'user_responsible_id',
+            model: 'users',
+            select: 'name surname email'
+        }]
+    },
+    {
+        path: 'operazioni_effettuate',
+        model: 'operations',
+        populate: [
+            {
+                path: 'operation_point_id',
+                model: 'lightPoints'
+            },
+            {
+                path: 'operation_responsible',
+                model: 'users',
+                select: 'name surname email'
+            },
+            {
+                path: 'report_to_solve',
+                model: 'reports'
+            }
+        ]
+    }
+];
+
+const GEOJSON_LIGHT_POINT_POPULATE = [
+    { path: 'segnalazioni_in_corso', model: 'reports' },
+    { path: 'segnalazioni_risolte', model: 'reports' },
+    {
+        path: 'operazioni_effettuate',
+        model: 'operations',
+        populate: [
+            { path: 'operation_point_id', model: 'lightPoints' },
+            { path: 'operation_responsible', model: 'users', select: 'name surname email' },
+            { path: 'report_to_solve', model: 'reports' }
+        ]
+    }
+];
+
+function parsePagination(query, defaultLimit = 500) {
+    const offset = Math.max(0, parseInt(query.offset, 10) || 0);
+    let limit = parseInt(query.limit, 10);
+    if (isNaN(limit) || limit <= 0) limit = defaultLimit;
+    limit = Math.min(limit, 1000);
+    return { offset, limit };
+}
+
+function lightPointToGeoJsonFeature(pl) {
+    const props = pl.toObject ? pl.toObject() : pl;
+    const { lat, lng, ...rest } = props;
+    const latStr = lat == null ? '' : String(lat);
+    const lngStr = lng == null ? '' : String(lng);
+    return {
+        type: 'Feature',
+        geometry: {
+            type: 'Point',
+            coordinates: [
+                parseFloat(lngStr.replace(',', '.')),
+                parseFloat(latStr.replace(',', '.'))
+            ]
+        },
+        properties: rest
+    };
+}
+
+function parseCoordValue(value) {
+    if (value == null || value === '') return null;
+    const n = Number(typeof value === 'string' ? value.trim().replace(',', '.') : value);
+    return Number.isFinite(n) ? n : null;
 }
 
 
@@ -67,11 +175,15 @@ router.post('/', async (req, res) => {
                 quadro: element.QUADRO,
                 proprieta: element.PROPRIETA,
                 tipo_apparecchio: element.TIPO_APPARECCHIO,
-                modello: element.MODELLO_ARMATURA,
+                armatura: element.ARMATURA,
+                marca_apparecchio: element.MARCA_APPARECCHIO,
+                modello_apparecchio: element.MODELLO_APPARECCHIO,
                 numero_apparecchi: element.NUMERO_APPARECCHI,
-                lampada_potenza: element.LAMPADA_E_POTENZA,
+                tipo_lampada: element.TIPO_LAMPADA,
+                potenza_lampada: element.POTENZA_LAMPADA,
                 tipo_sostegno: element.TIPO_SOSTEGNO,
                 tipo_linea: element.TIPO_LINEA,
+                altezza_sostegno: element.ALTEZZA_SOSTEGNO,
                 promiscuita: element.PROMISCUITA,
                 note: element.NOTE,
                 garanzia: element.GARANZIA,
@@ -129,7 +241,10 @@ router.post('/', async (req, res) => {
                             subject: mailSubject,
                             html: mailHtml
                         };
-                        await transporter.sendMail(mailOptions);
+                        await sendMailAndNotify(mailOptions, {
+                            type: 'UPLOAD_ERROR',
+                            townHallName: req.body.name,
+                        });
                         debugMail(batchErr);
                     } catch (e) {
                         console.error('Errore nell\'invio email:', e);
@@ -154,7 +269,10 @@ router.post('/', async (req, res) => {
                 subject: mailSubject,
                 html: mailHtml
             };
-            await transporter.sendMail(mailOptions);
+            await sendMailAndNotify(mailOptions, {
+                type: 'UPLOAD_SUCCESS',
+                townHallName: req.body.name,
+            });
         } catch (e) {
             debugMail('Errore nell\'invio email di notifica:', e);
         }
@@ -176,7 +294,10 @@ router.post('/', async (req, res) => {
                 subject: mailSubject,
                 html: mailHtml
             };
-            await transporter.sendMail(mailOptions);
+            await sendMailAndNotify(mailOptions, {
+                type: 'UPLOAD_ERROR',
+                townHallName: req.body.name,
+            });
             debugMail(err);
         } catch (e) {
             console.error('Errore nell\'invio email:', e);
@@ -268,38 +389,39 @@ function normalizeLightPointData(lp) {
         lowerCaseLp[key.toLowerCase()] = lp[key];
     });
 
-    // Mappa di conversione CSV → DB
-    const csvToDbFieldMap = {
-        'lampada_e_potenza': 'lampada_potenza',
-        'modello_armatura': 'modello',
-        // aggiungi qui altre conversioni se necessario
-    };
-
-    // Lista dei campi previsti dallo schema (tutti minuscoli)
     const allowedFields = [
         'marker', 'numero_palo', 'composizione_punto', 'indirizzo', 'lotto', 'quadro', 'proprieta',
-        'tipo_apparecchio', 'modello', 'numero_apparecchi', 'lampada_potenza', 'tipo_sostegno',
-        'tipo_linea', 'promiscuita', 'note', 'garanzia', 'lat', 'lng', 'pod', 'numero_contatore',
-        'alimentazione', 'potenza_contratto', 'potenza', 'punti_luce', 'tipo',
-        '_id', // per update
+        'tipo_apparecchio', 'armatura', 'marca_apparecchio', 'modello_apparecchio', 'numero_apparecchi',
+        'tipo_lampada', 'potenza_lampada', 'tipo_sostegno', 'tipo_linea', 'promiscuita', 'note', 'garanzia',
+        'lat', 'lng', 'pod', 'numero_contatore', 'alimentazione', 'potenza_contratto', 'potenza', 'punti_luce', 'tipo',
+        'altezza_sostegno', 'data_creazione',
+        '_id',
         'segnalazioni_in_corso', 'segnalazioni_risolte', 'operazioni_effettuate'
     ];
 
     const normalized = {};
     for (const key of allowedFields) {
-        // Se il campo esiste già con il nome giusto
-        if (lowerCaseLp.hasOwnProperty(key)) {
+        if (Object.prototype.hasOwnProperty.call(lowerCaseLp, key)) {
             normalized[key] = lowerCaseLp[key];
         }
-        // Se il campo esiste con il nome del CSV, lo mappo
-        else {
-            // Cerco se c'è una chiave CSV che mappa su questo campo DB
-            const csvKey = Object.keys(csvToDbFieldMap).find(csvField => csvToDbFieldMap[csvField] === key);
-            if (csvKey && lowerCaseLp.hasOwnProperty(csvKey)) {
-                normalized[key] = lowerCaseLp[csvKey];
-            }
+    }
+
+    // Migrazione alias CSV legacy → schema aggiornato
+    if (!normalized.armatura && lowerCaseLp.modello_armatura) {
+        normalized.armatura = lowerCaseLp.modello_armatura;
+    }
+    if (!normalized.modello_apparecchio && lowerCaseLp.modello) {
+        normalized.modello_apparecchio = lowerCaseLp.modello;
+    }
+    const legacyLampada = lowerCaseLp.lampada_e_potenza || lowerCaseLp.lampada_potenza;
+    if (!normalized.tipo_lampada && legacyLampada) {
+        const parts = String(legacyLampada).trim().split(/\s+/);
+        normalized.tipo_lampada = parts[0] || '';
+        if (!normalized.potenza_lampada) {
+            normalized.potenza_lampada = parts.slice(1).join(' ') || '';
         }
     }
+
     return normalized;
 }
 
@@ -342,7 +464,10 @@ router.post('/update/', async (req, res) => {
                     subject: mailSubject,
                     html: mailHtml
                 };
-                await transporter.sendMail(mailOptions);
+                await sendMailAndNotify(mailOptions, {
+                    type: 'UPLOAD_ERROR',
+                    townHallName: req.body.name,
+                });
             } catch (e) {
                 debugMail('Errore nell\'invio email di notifica:', e);
             }
@@ -419,7 +544,10 @@ router.post('/update/', async (req, res) => {
                             subject: mailSubject,
                             html: mailHtml
                         };
-                        await transporter.sendMail(mailOptions);
+                        await sendMailAndNotify(mailOptions, {
+                            type: 'UPLOAD_ERROR',
+                            townHallName: req.body.name,
+                        });
                         debugMail(bulkErr);
                     } catch (e) {
                         debugMail('Errore nell\'invio email:', e);
@@ -474,7 +602,10 @@ router.post('/update/', async (req, res) => {
                 subject: mailSubject,
                 html: mailHtml
             };
-            await transporter.sendMail(mailOptions);
+            await sendMailAndNotify(mailOptions, {
+                type: 'UPLOAD_ERROR',
+                townHallName: req.body.name,
+            });
             debugMail(err);
         } catch (e) {
             debugMail('Errore nell\'invio email:', e);
@@ -518,7 +649,10 @@ router.post('/update/', async (req, res) => {
                     }
                 ]
             };
-            await transporter.sendMail(mailOptions);
+            await sendMailAndNotify(mailOptions, {
+                type: 'UPLOAD_SUCCESS',
+                townHallName: req.body.name,
+            });
         } catch (e) {
             debugMail('Errore nell\'invio email di notifica:', e);
         }
@@ -576,49 +710,7 @@ router.get('/:name', async (req, res) => {
         const th = await townHalls.findOne({ name: req.params.name })
             .populate({
                 path: 'punti_luce',
-                populate: [
-                    {
-                        path: 'segnalazioni_in_corso',
-                        model: 'reports',
-                        populate: {
-                            path: 'user_creator_id',
-                            model: 'users',
-                            select: 'name surname email'
-                        }
-                    },
-                    {
-                        path: 'segnalazioni_risolte',
-                        model: 'reports',
-                        populate: [{
-                            path: 'user_creator_id',
-                            model: 'users',
-                            select: 'name surname email'
-                        }, {
-                            path: 'user_responsible_id',
-                            model: 'users',
-                            select: 'name surname email'
-                        }]
-                    },
-                    {
-                        path: 'operazioni_effettuate',
-                        model: 'operations',
-                        populate: [
-                            {
-                                path: 'operation_point_id',
-                                model: 'lightPoints'
-                            },
-                            {
-                                path: 'operation_responsible',
-                                model: 'users',
-                                select: 'name surname email'
-                            },
-                            {
-                                path: 'report_to_solve',
-                                model: 'reports'
-                            }
-                        ]
-                    }
-                ]
+                populate: LIGHT_POINT_FULL_POPULATE
             });
 
         if (th) {
@@ -630,6 +722,98 @@ router.get('/:name', async (req, res) => {
     } catch (err) {
         console.error(err);
         res.status(500).send('Errore del server');
+    }
+});
+
+/** Meta leggero: totale punti + centro senza populate */
+router.get('/:name/meta', async (req, res) => {
+    try {
+        const th = await townHalls.findOne({ name: req.params.name })
+            .select('name punti_luce coordinates');
+        if (!th) {
+            return res.status(404).json({ error: 'Comune non trovato' });
+        }
+
+        const total = th.punti_luce ? th.punti_luce.length : 0;
+        let center = null;
+
+        if (th.coordinates?.lat != null && th.coordinates?.lng != null) {
+            const lat = parseCoordValue(th.coordinates.lat);
+            const lng = parseCoordValue(th.coordinates.lng);
+            if (lat != null && lng != null) {
+                center = { lat, lng };
+            }
+        }
+
+        // Se manca il centro sul comune, prova il primo punto luce (solo lat/lng)
+        if (!center && total > 0) {
+            const firstId = th.punti_luce[0];
+            const first = await lightPoints.findById(firstId).select('lat lng').lean();
+            if (first) {
+                const lat = parseCoordValue(first.lat);
+                const lng = parseCoordValue(first.lng);
+                if (lat != null && lng != null) {
+                    center = { lat, lng };
+                }
+            }
+        }
+
+        res.json({
+            name: th.name,
+            total,
+            center
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Errore del server' });
+    }
+});
+
+/**
+ * Pagina di punti luce con populate completo (stesso shape di GET /:name).
+ * Query: offset, limit (default 500, max 1000)
+ */
+router.get('/:name/lightPoints', async (req, res) => {
+    try {
+        const { offset, limit } = parsePagination(req.query, 500);
+        const th = await townHalls.findOne({ name: req.params.name }).select('name punti_luce');
+        if (!th) {
+            return res.status(404).json({ error: 'Comune non trovato' });
+        }
+
+        const allIds = th.punti_luce || [];
+        const total = allIds.length;
+        const pageIds = allIds.slice(offset, offset + limit);
+
+        if (pageIds.length === 0) {
+            return res.json({
+                items: [],
+                total,
+                offset,
+                limit,
+                hasMore: false
+            });
+        }
+
+        const docs = await lightPoints.find({ _id: { $in: pageIds } })
+            .populate(LIGHT_POINT_FULL_POPULATE);
+
+        // Mantieni l'ordine degli ID del comune
+        const byId = new Map(docs.map(d => [d._id.toString(), d]));
+        const items = pageIds
+            .map(id => byId.get(id.toString()))
+            .filter(Boolean);
+
+        res.json({
+            items,
+            total,
+            offset,
+            limit,
+            hasMore: offset + limit < total
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Errore del server' });
     }
 });
 
@@ -730,47 +914,65 @@ router.get('/lightpoints/getPointGeoJSON/', async (req, res) => {
 
 router.get('/:name/geojson', async (req, res) => {
     try {
-        const th = await townHalls.findOne({ name: req.params.name })
-            .populate({
-                path: 'punti_luce',
-                populate: [
-                    { path: 'segnalazioni_in_corso', model: 'reports' },
-                    { path: 'segnalazioni_risolte', model: 'reports' },
-                    { path: 'operazioni_effettuate', model: 'operations',
-                        populate: [
-                            { path: 'operation_point_id', model: 'lightPoints' },
-                            { path: 'operation_responsible', model: 'users', select: 'name surname email' },
-                            { path: 'report_to_solve', model: 'reports' }
-                        ]
-                    }
-                ]
-            });
-
+        const th = await townHalls.findOne({ name: req.params.name }).select('name punti_luce');
         if (!th || !th.punti_luce || th.punti_luce.length === 0) {
             return res.status(404).send('Comune o punti luce non trovati');
         }
 
-        // Costruisci la FeatureCollection GeoJSON
-        const features = th.punti_luce
+        const allIds = th.punti_luce;
+        const total = allIds.length;
+        const hasPagination =
+            req.query.offset !== undefined || req.query.limit !== undefined;
 
-            .map(pl => {
-                const props = pl.toObject ? pl.toObject() : pl;
-                const { lat, lng, ...rest } = props;
-                return {
-                    type: "Feature",
-                    geometry: {
-                        type: "Point",
-                        coordinates: [parseFloat(lng.replace(",", ".")), parseFloat(lat.replace(",", "."))]
-                    },
-                    properties: rest
-                };
-            });
+        let pageIds = allIds;
+        let offset = 0;
+        let limit = total;
+
+        if (hasPagination) {
+            ({ offset, limit } = parsePagination(req.query, 500));
+            pageIds = allIds.slice(offset, offset + limit);
+        }
+
+        if (pageIds.length === 0) {
+            const empty = {
+                type: 'FeatureCollection',
+                city: th.name,
+                features: []
+            };
+            if (hasPagination) {
+                return res.json({
+                    ...empty,
+                    total,
+                    offset,
+                    limit,
+                    hasMore: false
+                });
+            }
+            return res.json(empty);
+        }
+
+        const docs = await lightPoints.find({ _id: { $in: pageIds } })
+            .populate(GEOJSON_LIGHT_POINT_POPULATE);
+
+        const byId = new Map(docs.map(d => [d._id.toString(), d]));
+        const ordered = pageIds.map(id => byId.get(id.toString())).filter(Boolean);
+        const features = ordered.map(lightPointToGeoJsonFeature);
 
         const geojson = {
-            type: "FeatureCollection",
+            type: 'FeatureCollection',
             city: th.name,
             features
         };
+
+        if (hasPagination) {
+            return res.json({
+                ...geojson,
+                total,
+                offset,
+                limit,
+                hasMore: offset + limit < total
+            });
+        }
 
         res.json(geojson);
     } catch (err) {

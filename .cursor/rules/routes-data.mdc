@@ -1,0 +1,25 @@
+---
+description: "Route API, Mongoose e export report"
+globs: ["routes/**/*.js", "schemas/**/*.js", "utils/lightPointHelpers.js"]
+alwaysApply: false
+---
+
+- Ogni route handler async deve avere try/catch esplicito con risposta di
+  errore coerente (status + messaggio JSON), non lasciare eccezioni non
+  gestite che fanno crashare il processo Express.
+- Query Mongoose: usa i modelli in schemas/, non costruire query raw sul
+  driver MongoDB nativo. Filtra sempre per townHall/comune quando l'utente
+  non è Super Amministratore, per evitare data leak tra comuni diversi.
+- Export dati (reports.js): il progetto usa sia xlsx che json2csv — usa
+  xlsx per i file scaricabili in formato Excel (come già fatto), json2csv
+  solo se serve output CSV puro. Non introdurre altre librerie di export.
+- Notifiche: per email usa il transporter già configurato in config/email.js
+  (nodemailer, con mailgun.js come provider alternativo); per notifiche
+  push usa web-push con le chiavi VAPID esistenti; per notifiche in-app
+  usa schemas/notifications.js + utils/notificationHelpers.js e creale
+  sempre insieme all'invio email (safeNotify) — non introdurre altri
+  servizi di notifica senza discuterne prima.
+- lightPointHelpers.js contiene la logica di stato dei punti luce (attivo/
+  guasto/manutenzione): mantieni questi stati coerenti con quelli usati
+  nel frontend Lighting-map — se cambi un nome di stato qui, verifica
+  l'impatto anche sull'altro repo.

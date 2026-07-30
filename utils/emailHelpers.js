@@ -236,6 +236,7 @@ async function sendConfirmationEmail(user) {
                 }
             ]
         });
+
     } catch (e) {
         debugMail(e);
         // Rimuovi il timestamp se invio fallisce
@@ -281,6 +282,18 @@ async function sendResetPasswordEmail(user, resetUrl) {
                 }
             ]
         });
+        if (user._id) {
+            const { createNotification, safeNotify } = require('./notificationHelpers');
+            await safeNotify(() =>
+                createNotification({
+                    userId: user._id,
+                    title: 'Reset password richiesto',
+                    body: 'Ti abbiamo inviato un link per reimpostare la password. Scade tra 15 minuti.',
+                    type: 'PASSWORD_RESET',
+                    url: '/dashboard',
+                })
+            );
+        }
     } catch (e) {
         debugMail(e);
         throw e;
