@@ -28,7 +28,7 @@
     "xlsx": "^0.18.5"
   },
   "engines": {
-    "node": ">=v16"
+    "node": "22.x"
   },
   "devDependencies": {
     "cross-env": "^10.1.0"
