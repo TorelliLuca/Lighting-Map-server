@@ -8,7 +8,7 @@ const schema = new Schema({
     email: String,
     password: {type: String, required: true},
     date: {type: Date, default: Date.now()},
-    user_type: {type: String, enum: ['DEFAULT_USER', 'MAINTAINER', 'ADMINISTRATOR', 'SUPER_ADMIN'], default: 'DEFAULT_USER'},
+    user_type: {type: String, enum: ['DEFAULT_USER', 'MAINTAINER', 'ADMINISTRATOR', 'SUPER_ADMIN', 'SURVEYOR'], default: 'DEFAULT_USER'},
     town_halls_list: [{type: Schema.Types.ObjectId, ref: 'townHalls'}],
     is_approved: {type: Boolean, default: false},
     emailVerified: {type: Boolean, default: false},

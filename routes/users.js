@@ -160,6 +160,7 @@ router.post('/update/modifyUser', async (req, res) => {
         usr.name = userData.name;
         usr.surname = userData.surname;
         usr.user_type = userData.user_type; 
+        usr.email = userData.email;
         
         if (userData.password) {
             usr.password = userData.password;

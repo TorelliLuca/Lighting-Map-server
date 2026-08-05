@@ -279,6 +279,229 @@ router.put("/associate-townhall-to-organization", async (req, res) => {
     }
 });
 
+const ALLOWED_ORG_UPDATE_FIELDS = ['name', 'description', 'logo', 'address', 'location', 'townhallId'];
+const ADDRESS_FIELDS = ['street', 'city', 'province', 'postal_code', 'state'];
+const NAME_SPECIAL_CHARS_RE = /[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]+/;
+
+/**
+ * Valida il body di aggiornamento organizzazione (PATCH parziale).
+ * @returns {{ errors: string[], updates: object }}
+ */
+function validateOrganizationPatch(body) {
+    const errors = [];
+    const updates = {};
+
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return { errors: ['Body non valido: richiesto un oggetto JSON.'], updates: {} };
+    }
+
+    const unknownKeys = Object.keys(body).filter((key) => !ALLOWED_ORG_UPDATE_FIELDS.includes(key));
+    if (unknownKeys.length > 0) {
+        errors.push(`Campi non consentiti: ${unknownKeys.join(', ')}. Consentiti: ${ALLOWED_ORG_UPDATE_FIELDS.join(', ')}.`);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(body, 'name')) {
+        if (typeof body.name !== 'string' || !body.name.trim()) {
+            errors.push('Il nome è obbligatorio e deve essere una stringa non vuota.');
+        } else if (NAME_SPECIAL_CHARS_RE.test(body.name)) {
+            errors.push('Il nome non può contenere caratteri speciali.');
+        } else {
+            updates.name = body.name.trim();
+        }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(body, 'description')) {
+        if (body.description !== null && typeof body.description !== 'string') {
+            errors.push('La descrizione deve essere una stringa.');
+        } else {
+            updates.description = body.description == null ? '' : body.description.trim();
+        }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(body, 'logo')) {
+        if (body.logo !== null && typeof body.logo !== 'string') {
+            errors.push('Il logo deve essere una stringa (URL o data URL).');
+        } else {
+            updates.logo = body.logo == null ? '' : body.logo;
+        }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(body, 'address')) {
+        if (body.address === null) {
+            updates.address = {};
+        } else if (typeof body.address !== 'object' || Array.isArray(body.address)) {
+            errors.push('L\'indirizzo deve essere un oggetto.');
+        } else {
+            const addressUnknown = Object.keys(body.address).filter((key) => !ADDRESS_FIELDS.includes(key));
+            if (addressUnknown.length > 0) {
+                errors.push(`Campi indirizzo non consentiti: ${addressUnknown.join(', ')}.`);
+            }
+            const address = {};
+            for (const field of ADDRESS_FIELDS) {
+                if (!Object.prototype.hasOwnProperty.call(body.address, field)) continue;
+                const value = body.address[field];
+                if (value !== null && typeof value !== 'string') {
+                    errors.push(`address.${field} deve essere una stringa.`);
+                } else {
+                    address[field] = value == null ? '' : value.trim();
+                }
+            }
+            if (Object.keys(address).length > 0 || Object.keys(body.address).length === 0) {
+                updates.address = address;
+            }
+        }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(body, 'location')) {
+        if (body.location === null) {
+            errors.push('La location non può essere null; omettila se non va aggiornata.');
+        } else if (typeof body.location !== 'object' || Array.isArray(body.location)) {
+            errors.push('La location deve essere un oggetto GeoJSON Point.');
+        } else {
+            const { type, coordinates } = body.location;
+            if (type != null && type !== 'Point') {
+                errors.push('location.type deve essere "Point".');
+            }
+            if (!Array.isArray(coordinates) || coordinates.length !== 2) {
+                errors.push('location.coordinates deve essere un array [lng, lat].');
+            } else {
+                const [lng, lat] = coordinates.map(Number);
+                if (!Number.isFinite(lng) || !Number.isFinite(lat)) {
+                    errors.push('location.coordinates deve contenere numeri validi [lng, lat].');
+                } else if (lng < -180 || lng > 180 || lat < -90 || lat > 90) {
+                    errors.push('location.coordinates fuori range (lng -180..180, lat -90..90).');
+                } else {
+                    updates.location = { type: 'Point', coordinates: [lng, lat] };
+                }
+            }
+        }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(body, 'townhallId')) {
+        if (body.townhallId === null || body.townhallId === '') {
+            updates.townhallId = null;
+        } else if (typeof body.townhallId !== 'string' || !mongoose.Types.ObjectId.isValid(body.townhallId)) {
+            errors.push('townhallId non valido.');
+        } else {
+            updates.townhallId = body.townhallId;
+        }
+    }
+
+    if (errors.length === 0 && Object.keys(updates).length === 0) {
+        errors.push('Nessun campo valido da aggiornare.');
+    }
+
+    return { errors, updates };
+}
+
+router.patch('/:id', async (req, res) => {
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        const organizationId = req.params.id;
+
+        if (!mongoose.Types.ObjectId.isValid(organizationId)) {
+            await session.abortTransaction();
+            session.endSession();
+            return res.status(400).json({ error: 'ID organizzazione non valido.' });
+        }
+
+        const { errors, updates } = validateOrganizationPatch(req.body);
+        if (errors.length > 0) {
+            await session.abortTransaction();
+            session.endSession();
+            return res.status(400).json({ error: 'Validazione fallita.', details: errors });
+        }
+
+        const organization = await organizations.findById(organizationId).session(session);
+        if (!organization) {
+            await session.abortTransaction();
+            session.endSession();
+            return res.status(404).json({ error: 'Organizzazione non trovata.' });
+        }
+
+        const unsetFields = {};
+
+        if (Object.prototype.hasOwnProperty.call(updates, 'townhallId')) {
+            if (organization.type !== 'TOWNHALL') {
+                await session.abortTransaction();
+                session.endSession();
+                return res.status(400).json({
+                    error: 'Validazione fallita.',
+                    details: ['townhallId può essere modificato solo per organizzazioni di tipo TOWNHALL.'],
+                });
+            }
+
+            const newTownhallId = updates.townhallId;
+            const previousTownhallId = organization.townhallId ? organization.townhallId.toString() : null;
+
+            if (newTownhallId) {
+                const townhallToUpdate = await townHalls.findById(newTownhallId).session(session);
+                if (!townhallToUpdate) {
+                    await session.abortTransaction();
+                    session.endSession();
+                    return res.status(404).json({ error: 'Comune non trovato.' });
+                }
+
+                const alreadyTaken =
+                    townhallToUpdate.organization_admin &&
+                    townhallToUpdate.organization_admin.toString() !== organizationId;
+                if (alreadyTaken) {
+                    await session.abortTransaction();
+                    session.endSession();
+                    return res.status(409).json({
+                        error: 'Il comune è già associato a un\'altra organizzazione.',
+                    });
+                }
+
+                townhallToUpdate.organization_admin = organization._id;
+                await townhallToUpdate.save({ session });
+            } else {
+                delete updates.townhallId;
+                unsetFields.townhallId = "";
+            }
+
+            if (previousTownhallId && previousTownhallId !== newTownhallId) {
+                await townHalls.updateOne(
+                    { _id: previousTownhallId, organization_admin: organizationId },
+                    { $unset: { organization_admin: "" } },
+                    { session }
+                );
+            }
+        }
+
+        updates.updated_at = new Date();
+
+        const updateQuery = { $set: updates };
+        if (Object.keys(unsetFields).length > 0) {
+            updateQuery.$unset = unsetFields;
+        }
+
+        const updatedOrganization = await organizations.findByIdAndUpdate(
+            organizationId,
+            updateQuery,
+            { new: true, runValidators: true, session }
+        );
+
+        await session.commitTransaction();
+        session.endSession();
+
+        res.status(200).json(updatedOrganization);
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        console.error(err);
+        if (err.name === 'ValidationError') {
+            return res.status(400).json({
+                error: 'Validazione schema fallita.',
+                details: Object.values(err.errors).map((e) => e.message),
+            });
+        }
+        res.status(500).json({ error: 'Errore interno del server.' });
+    }
+});
+
 router.delete('/:id', async (req, res) => {
     // Inizia una sessione di transazione per garantire l'atomicità
     const session = await mongoose.startSession();

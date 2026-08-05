@@ -30,14 +30,16 @@ const schema = new Schema({
     punti_luce: {type: String, default: ""},
     tipo: {type: String, default: ""},
     altezza_sostegno: {type: String, default: ""},
+    /** Genitore topologico (QE o PL a monte). null = radice / scollegato. */
+    parent: { type: Schema.Types.ObjectId, ref: "lightPoints", default: null },
     segnalazioni_in_corso:[{type: Schema.Types.ObjectId, ref: "reports"}],
     segnalazioni_risolte:[{type: Schema.Types.ObjectId, ref: "reports"}],
     operazioni_effettuate: [{type: Schema.Types.ObjectId, ref: "operations"}]   ,
     data_creazione: { type: Date, default: Date.now },
 })
 
-//per esportare il modello
-module.exports = model("lightPoints", schema)  
+schema.index({ quadro: 1, parent: 1 });
+schema.index({ parent: 1 });
 
 schema.post('findOneAndDelete', async function(doc) {
     if (doc) {
@@ -47,6 +49,9 @@ schema.post('findOneAndDelete', async function(doc) {
       );
     }
   });
+
+//per esportare il modello
+module.exports = model("lightPoints", schema)
 
 /*
 Punto luce spento

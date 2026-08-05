@@ -6,6 +6,7 @@ const emailTemplateAfterOperation = require('../email/afterOperation/htmlText');
 const emailTemplateConfirmEmail = require('../email/confirmEmail/htmlText');
 const emailResetPassword = require('../email/resetPassword/htmlText');
 const emailTemplateUserValidated = require('../email/userValidated/htmlText');
+const { formatParentAmbiguitiesHtml } = require('./utility');
 
 function returnHtmlEmail(username) {
   const htmlEmail = emailTemplate.replace('USERNAME', username);
@@ -69,7 +70,7 @@ function returnHtmlResetPassword(user, link) {
     return htmlEmail;
 }
 
-function returnHtmlEmailUploadSuccess(nomeComune, batchStatus) {
+function returnHtmlEmailUploadSuccess(nomeComune, batchStatus, parentAmbiguities = []) {
     return `
         <div style="font-family: Arial, sans-serif; background: #f4f6fb; padding: 32px;">
             <div style="max-width: 600px; margin: auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.07); padding: 32px;">
@@ -86,6 +87,7 @@ function returnHtmlEmailUploadSuccess(nomeComune, batchStatus) {
                         ${batchStatus.map(b => `<li style=\"margin-bottom: 4px;\">Batch <b>${b.batch}</b>: <span style=\"color: #388e3c;\">${b.status}</span></li>`).join('')}
                     </ul>
                 </div>
+                ${formatParentAmbiguitiesHtml(parentAmbiguities)}
                 <p style=\"color: #666; font-size: 15px; margin-top: 32px;\">
                     Grazie per aver utilizzato <b>Lighting Map</b>!<br>
                     <span style=\"font-size: 13px; color: #aaa;\">Questa è una notifica automatica, si prega di non rispondere a questa email.</span>

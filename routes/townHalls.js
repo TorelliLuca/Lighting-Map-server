@@ -7,7 +7,18 @@ const users = require('../schemas/users');
 const XLSX = require('xlsx');
 const { transporter, emailLighting, debugMail } = require('../config/email');
 const { returnHtmlEmailUploadSuccess, returnHtmlEmailUploadError } = require('../utils/emailHelpers');
-const { toCsvItalianStyle, normalizeKeysToLowerCase, isEmptyLightPoint, compareNumeroPalo } = require('../utils/utility');
+const {
+    toCsvItalianStyle,
+    normalizeKeysToLowerCase,
+    isEmptyLightPoint,
+    compareNumeroPalo,
+    enrichLightPointsWithNumeroPaloParent,
+    resolveParentJobsFromNumeroPalo,
+    formatParentAmbiguitiesHtml,
+    toIdString,
+    applyItalianCoordinatesToLightPoint,
+    parseCoordValue
+} = require('../utils/utility');
 const { createNotificationsForEmails, safeNotify } = require('../utils/notificationHelpers');
 
 const router = express.Router();
@@ -18,6 +29,71 @@ function chunkArray(array, size) {
         result.push(array.slice(i, i + size));
     }
     return result;
+}
+
+function isValidObjectId(value) {
+    if (value == null || value === '') return false;
+    const s = String(value);
+    return mongoose.Types.ObjectId.isValid(s) && String(new mongoose.Types.ObjectId(s)) === s;
+}
+
+/**
+ * Separa i campi DB da numero_palo_parent (solo CSV) e normalizza parent.
+ * Se né parent né numero_palo_parent sono presenti nell'input, parent non viene toccato.
+ * @returns {{ doc: object, numero_palo_parent: string, hasValidParent: boolean, needsParentResolve: boolean }}
+ */
+function splitParentCsvFields(normalizedLp) {
+    const hasParentKey = Object.prototype.hasOwnProperty.call(normalizedLp || {}, 'parent');
+    const hasNppKey = Object.prototype.hasOwnProperty.call(normalizedLp || {}, 'numero_palo_parent');
+
+    const {
+        numero_palo_parent,
+        segnalazioni_in_corso,
+        segnalazioni_risolte,
+        operazioni_effettuate,
+        ...rest
+    } = normalizedLp || {};
+
+    const npp = hasNppKey && numero_palo_parent != null ? String(numero_palo_parent).trim() : '';
+    let hasValidParent = false;
+
+    if (hasParentKey) {
+        if (isValidObjectId(rest.parent)) {
+            rest.parent = new mongoose.Types.ObjectId(String(rest.parent));
+            hasValidParent = true;
+        } else {
+            rest.parent = null;
+        }
+    } else {
+        delete rest.parent;
+    }
+
+    return {
+        doc: rest,
+        numero_palo_parent: npp,
+        hasValidParent,
+        needsParentResolve: !hasValidParent && npp.length > 0
+    };
+}
+
+/**
+ * Dopo insert/update, risolve parent da numero_palo_parent e applica i $set.
+ */
+async function applyResolvedParents(jobs, candidates, session) {
+    const { resolved, ambiguities } = resolveParentJobsFromNumeroPalo(jobs, candidates);
+    if (resolved.length > 0) {
+        const ops = resolved.map(({ childId, parentId }) => ({
+            updateOne: {
+                filter: { _id: childId },
+                update: { $set: { parent: parentId } }
+            }
+        }));
+        const BATCH = 100;
+        for (let i = 0; i < ops.length; i += BATCH) {
+            await lightPoints.bulkWrite(ops.slice(i, i + BATCH), { session });
+        }
+    }
+    return ambiguities;
 }
 
 /** Invio email upload/update + notifica in-app allo stesso destinatario. */
@@ -121,10 +197,17 @@ function lightPointToGeoJsonFeature(pl) {
     };
 }
 
-function parseCoordValue(value) {
-    if (value == null || value === '') return null;
-    const n = Number(typeof value === 'string' ? value.trim().replace(',', '.') : value);
-    return Number.isFinite(n) ? n : null;
+function formatCoordErrorsHtml(coordErrors) {
+    if (!Array.isArray(coordErrors) || coordErrors.length === 0) return '';
+    const items = coordErrors.map(e =>
+        `<li>Punto <b>${e.numero_palo || '—'}</b> (marker: ${e.marker || '—'}): ${e.reasons.join('; ')}</li>`
+    ).join('');
+    return `
+        <h3>Coordinate non valide</h3>
+        <p>Sono ammesse solo coordinate numeriche ben formattate (es. <code>45,123</code> o <code>45.123</code>).
+        Il punto come separatore decimale viene convertito in virgola.</p>
+        <ul>${items}</ul>
+    `;
 }
 
 
@@ -164,46 +247,71 @@ router.post('/', async (req, res) => {
 
         let puntiLuceIds = [];
         const BATCH_SIZE = 300;
+        let parentAmbiguities = [];
 
         if (req.body.light_points && Array.isArray(req.body.light_points) && req.body.light_points.length > 0) {
-            const lightPointsData = req.body.light_points.map(element => ({
-                marker: element.MARKER,
-                numero_palo: element.NUMERO_PALO,
-                composizione_punto: element.COMPOSIZIONE_PUNTO,
-                indirizzo: element.INDIRIZZO,
-                lotto: element.LOTTO,
-                quadro: element.QUADRO,
-                proprieta: element.PROPRIETA,
-                tipo_apparecchio: element.TIPO_APPARECCHIO,
-                armatura: element.ARMATURA,
-                marca_apparecchio: element.MARCA_APPARECCHIO,
-                modello_apparecchio: element.MODELLO_APPARECCHIO,
-                numero_apparecchi: element.NUMERO_APPARECCHI,
-                tipo_lampada: element.TIPO_LAMPADA,
-                potenza_lampada: element.POTENZA_LAMPADA,
-                tipo_sostegno: element.TIPO_SOSTEGNO,
-                tipo_linea: element.TIPO_LINEA,
-                altezza_sostegno: element.ALTEZZA_SOSTEGNO,
-                promiscuita: element.PROMISCUITA,
-                note: element.NOTE,
-                garanzia: element.GARANZIA,
-                lat: element.lat,
-                lng: element.lng,
-                pod: element.POD,
-                numero_contatore: element.NUMERO_CONTATORE,
-                alimentazione: element.ALIMENTAZIONE,
-                potenza_contratto: element.POTENZA_CONTRATTO,
-                potenza: element.POTENZA,
-                punti_luce: element.PUNTI_LUCE,
-                tipo: element.TIPO
+            const prepared = req.body.light_points
+                .map(element => splitParentCsvFields(normalizeLightPointData(element)))
+                .filter(({ doc }) => !isEmptyLightPoint(doc));
+
+            const coordErrors = [];
+            for (const p of prepared) {
+                const reasons = applyItalianCoordinatesToLightPoint(p.doc);
+                if (reasons.length > 0) {
+                    coordErrors.push({
+                        marker: p.doc.marker,
+                        numero_palo: p.doc.numero_palo,
+                        reasons
+                    });
+                }
+            }
+            if (coordErrors.length > 0) {
+                await session.abortTransaction();
+                session.endSession();
+                responseStatus = 400;
+                responseMessage = `Coordinate non valide in ${coordErrors.length} punti luce`;
+                mailSubject = 'Errore coordinate durante il caricamento';
+                mailHtml = formatCoordErrorsHtml(coordErrors);
+                res.status(responseStatus).send(responseMessage);
+                try {
+                    const adminEmails = req.body.userEmail;
+                    const mailOptions = {
+                        from: `LIGHTING MAP<${emailLighting}>`,
+                        to: adminEmails,
+                        subject: mailSubject,
+                        html: mailHtml
+                    };
+                    await sendMailAndNotify(mailOptions, {
+                        type: 'UPLOAD_ERROR',
+                        townHallName: req.body.name,
+                    });
+                } catch (e) {
+                    console.error('Errore nell\'invio email:', e);
+                }
+                return;
+            }
+
+            const lightPointsData = prepared.map(p => {
+                // In creazione parent assente → null esplicito (default schema)
+                if (!Object.prototype.hasOwnProperty.call(p.doc, 'parent')) {
+                    p.doc.parent = null;
+                }
+                return p.doc;
+            });
+            const parentJobsMeta = prepared.map(p => ({
+                numero_palo_parent: p.numero_palo_parent,
+                needsParentResolve: p.needsParentResolve
             }));
 
             const batches = chunkArray(lightPointsData, BATCH_SIZE);
+            const allInserted = [];
+
             for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
                 const batch = batches[batchIndex];
                 try {
                     const inserted = await light_points.insertMany(batch, { session });
                     puntiLuceIds.push(...inserted.map(lp => lp._id));
+                    allInserted.push(...inserted);
                     batchStatus.push({ batch: batchIndex + 1, status: 'ok' });
                 } catch (batchErr) {
                     let markerErrore = null;
@@ -252,13 +360,30 @@ router.post('/', async (req, res) => {
                     return;
                 }
             }
+
+            // Risolvi parent da numero_palo_parent (query inversa sul comune appena caricato)
+            const parentJobs = [];
+            for (let i = 0; i < allInserted.length; i++) {
+                const meta = parentJobsMeta[i];
+                if (!meta || !meta.needsParentResolve) continue;
+                parentJobs.push({
+                    childId: toIdString(allInserted[i]._id),
+                    childNumeroPalo: allInserted[i].numero_palo,
+                    childMarker: allInserted[i].marker,
+                    numero_palo_parent: meta.numero_palo_parent
+                });
+            }
+            if (parentJobs.length > 0) {
+                parentAmbiguities = await applyResolvedParents(parentJobs, allInserted, session);
+            }
+
             th[0].punti_luce = puntiLuceIds;
             await th[0].save({ session });
         }
 
         await session.commitTransaction();
         session.endSession();
-        mailHtml = returnHtmlEmailUploadSuccess(req.body.name, batchStatus);
+        mailHtml = returnHtmlEmailUploadSuccess(req.body.name, batchStatus, parentAmbiguities);
         res.status(responseStatus).send(responseMessage);
         // Invia mail dopo la risposta
         try {
@@ -369,7 +494,7 @@ function prepareBulkOps(incomingPoints) {
 }
 
 // Funzione per generare l'HTML della mail di successo con riepilogo quantità
-function returnHtmlEmailUpdateSuccessSummary(nomeComune, eliminati, modificati, aggiunti) {
+function returnHtmlEmailUpdateSuccessSummary(nomeComune, eliminati, modificati, aggiunti, parentAmbiguities = []) {
     return `
         <h2>Aggiornamento punti luce per il comune di <b>${nomeComune}</b> completato con successo!</h2>
         <ul>
@@ -377,6 +502,7 @@ function returnHtmlEmailUpdateSuccessSummary(nomeComune, eliminati, modificati, 
             <li><b>Modificati</b>: ${modificati.length}</li>
             <li><b>Aggiunti</b>: ${aggiunti.length}</li>
         </ul>
+        ${formatParentAmbiguitiesHtml(parentAmbiguities)}
         <p>In allegato trovi il file Excel con il dettaglio completo.</p>
     `;
 }
@@ -395,6 +521,7 @@ function normalizeLightPointData(lp) {
         'tipo_lampada', 'potenza_lampada', 'tipo_sostegno', 'tipo_linea', 'promiscuita', 'note', 'garanzia',
         'lat', 'lng', 'pod', 'numero_contatore', 'alimentazione', 'potenza_contratto', 'potenza', 'punti_luce', 'tipo',
         'altezza_sostegno', 'data_creazione',
+        'parent',
         '_id',
         'segnalazioni_in_corso', 'segnalazioni_risolte', 'operazioni_effettuate'
     ];
@@ -406,6 +533,11 @@ function normalizeLightPointData(lp) {
         }
     }
 
+    // Campo solo CSV: numero palo del parent (risolto a ObjectId in un secondo passaggio)
+    if (Object.prototype.hasOwnProperty.call(lowerCaseLp, 'numero_palo_parent')) {
+        normalized.numero_palo_parent = lowerCaseLp.numero_palo_parent;
+    }
+
     // Migrazione alias CSV legacy → schema aggiornato
     if (!normalized.armatura && lowerCaseLp.modello_armatura) {
         normalized.armatura = lowerCaseLp.modello_armatura;
@@ -414,9 +546,11 @@ function normalizeLightPointData(lp) {
         normalized.modello_apparecchio = lowerCaseLp.modello;
     }
     const legacyLampada = lowerCaseLp.lampada_e_potenza || lowerCaseLp.lampada_potenza;
-    if (!normalized.tipo_lampada && legacyLampada) {
+    if (legacyLampada && (!normalized.tipo_lampada || !normalized.potenza_lampada)) {
         const parts = String(legacyLampada).trim().split(/\s+/);
-        normalized.tipo_lampada = parts[0] || '';
+        if (!normalized.tipo_lampada) {
+            normalized.tipo_lampada = parts[0] || '';
+        }
         if (!normalized.potenza_lampada) {
             normalized.potenza_lampada = parts.slice(1).join(' ') || '';
         }
@@ -442,6 +576,7 @@ router.post('/update/', async (req, res) => {
     let eliminatiFull = [];
     let modificatiFull = [];
     let aggiuntiFull = [];
+    let parentAmbiguities = [];
     // Costante per batch size
     const BATCH_SIZE = 100;
     try {
@@ -486,8 +621,61 @@ router.post('/update/', async (req, res) => {
             }
             return true;
         });
+
+        const parentMetaByIndex = [];
+        const docsForBulk = incomingPoints.map((lp, idx) => {
+            const split = splitParentCsvFields(lp);
+            parentMetaByIndex[idx] = {
+                numero_palo_parent: split.numero_palo_parent,
+                needsParentResolve: split.needsParentResolve,
+                childNumeroPalo: split.doc.numero_palo,
+                childMarker: split.doc.marker,
+                childId: lp._id ? String(lp._id) : null
+            };
+            const forDb = { ...split.doc };
+            if (lp._id) forDb._id = lp._id;
+            return forDb;
+        });
+
+        const coordErrors = [];
+        for (const doc of docsForBulk) {
+            const reasons = applyItalianCoordinatesToLightPoint(doc);
+            if (reasons.length > 0) {
+                coordErrors.push({
+                    marker: doc.marker,
+                    numero_palo: doc.numero_palo,
+                    reasons
+                });
+            }
+        }
+        if (coordErrors.length > 0) {
+            await session.abortTransaction();
+            session.endSession();
+            responseStatus = 400;
+            responseMessage = `Coordinate non valide in ${coordErrors.length} punti luce`;
+            mailSubject = 'Errore coordinate durante aggiornamento';
+            mailHtml = formatCoordErrorsHtml(coordErrors);
+            res.status(responseStatus).send(responseMessage);
+            try {
+                const adminEmails = req.body.userEmail;
+                const mailOptions = {
+                    from: `LIGHTING MAP<${emailLighting}>`,
+                    to: adminEmails,
+                    subject: mailSubject,
+                    html: mailHtml
+                };
+                await sendMailAndNotify(mailOptions, {
+                    type: 'UPLOAD_ERROR',
+                    townHallName: req.body.name,
+                });
+            } catch (e) {
+                debugMail('Errore nell\'invio email di notifica:', e);
+            }
+            return;
+        }
+
         // 4. Calcola cosa eliminare
-        const { toDelete } = diffLightPoints(existingIds, incomingPoints);
+        const { toDelete } = diffLightPoints(existingIds, docsForBulk);
         eliminati = [...toDelete];
         // Recupera i dati completi dei punti luce eliminati prima di cancellarli (in batch)
         if (eliminati.length > 0) {
@@ -498,8 +686,8 @@ router.post('/update/', async (req, res) => {
             }
         }
         // 5. Calcola modificati e aggiunti
-        modificati = incomingPoints.filter(lp => lp._id && existingIds.includes(lp._id.toString())).map(lp => lp._id);
-        aggiunti = incomingPoints.filter(lp => !lp._id);
+        modificati = docsForBulk.filter(lp => lp._id && existingIds.includes(lp._id.toString())).map(lp => lp._id);
+        aggiunti = docsForBulk.filter(lp => !lp._id);
 
         // 6. Elimina in batch
         if (toDelete.length > 0) {
@@ -509,17 +697,26 @@ router.post('/update/', async (req, res) => {
             }
         }
         // 7. Aggiorna/inserisci in batch
-        const bulkOps = prepareBulkOps(incomingPoints);
-        // Array per raccogliere i nuovi _id inseriti
-        let insertedIds = [];
+        const bulkOps = prepareBulkOps(docsForBulk);
+        const insertIncomingIndices = [];
+        docsForBulk.forEach((d, i) => {
+            if (!d._id) insertIncomingIndices.push(i);
+        });
+        // Array per raccogliere i nuovi _id inseriti (ordine = ordine insertOne)
+        let orderedInsertedIds = [];
         if (bulkOps.length > 0) {
             for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
                 const batchOps = bulkOps.slice(i, i + BATCH_SIZE);
                 try {
                     const result = await lightPoints.bulkWrite(batchOps, { session });
-                    // Estrai i nuovi _id dagli insertOne
                     if (result && result.insertedIds) {
-                        Object.values(result.insertedIds).forEach(id => insertedIds.push(id));
+                        const ids = result.insertedIds;
+                        const entries = ids instanceof Map
+                            ? [...ids.entries()]
+                            : Object.entries(ids);
+                        entries
+                            .sort((a, b) => Number(a[0]) - Number(b[0]))
+                            .forEach(([, id]) => orderedInsertedIds.push(id));
                     }
                 } catch (bulkErr) {
                     await session.abortTransaction();
@@ -556,6 +753,13 @@ router.post('/update/', async (req, res) => {
                 }
             }
         }
+
+        insertIncomingIndices.forEach((incomingIdx, j) => {
+            if (orderedInsertedIds[j]) {
+                parentMetaByIndex[incomingIdx].childId = toIdString(orderedInsertedIds[j]);
+            }
+        });
+
         // 8. Recupera tutti gli _id aggiornati (inclusi quelli nuovi) in batch
         let updatedLightPoints = [];
         // Per i modificati
@@ -568,14 +772,33 @@ router.post('/update/', async (req, res) => {
             }
         }
         // Per gli aggiunti: ora abbiamo gli _id direttamente
-        if (insertedIds.length > 0) {
-            for (let i = 0; i < insertedIds.length; i += BATCH_SIZE) {
-                const batchIds = insertedIds.slice(i, i + BATCH_SIZE);
+        if (orderedInsertedIds.length > 0) {
+            for (let i = 0; i < orderedInsertedIds.length; i += BATCH_SIZE) {
+                const batchIds = orderedInsertedIds.slice(i, i + BATCH_SIZE);
                 const batchData = await lightPoints.find({ _id: { $in: batchIds } }).lean().session(session);
                 aggiuntiFull = aggiuntiFull.concat(batchData);
                 updatedLightPoints = updatedLightPoints.concat(batchData.map(lp => lp._id));
             }
         }
+
+        // 8b. Risolvi parent da numero_palo_parent sul comune aggiornato
+        const parentJobs = parentMetaByIndex
+            .filter(m => m && m.needsParentResolve && m.childId)
+            .map(m => ({
+                childId: m.childId,
+                childNumeroPalo: m.childNumeroPalo,
+                childMarker: m.childMarker,
+                numero_palo_parent: m.numero_palo_parent
+            }));
+        if (parentJobs.length > 0) {
+            const candidates = await lightPoints
+                .find({ _id: { $in: updatedLightPoints } })
+                .select('_id numero_palo marker')
+                .lean()
+                .session(session);
+            parentAmbiguities = await applyResolvedParents(parentJobs, candidates, session);
+        }
+
         // 9. Aggiorna la lista punti_luce del comune (solo ID unici)
         th.punti_luce = Array.from(new Set(updatedLightPoints));
         await th.save({ session });
@@ -632,7 +855,7 @@ router.post('/update/', async (req, res) => {
             XLSX.utils.book_append_sheet(workbook, wsVuoto, 'Nessuna Modifica');
         }
         const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-        mailHtml = returnHtmlEmailUpdateSuccessSummary(req.body.name, eliminati, modificati, aggiunti);
+        mailHtml = returnHtmlEmailUpdateSuccessSummary(req.body.name, eliminati, modificati, aggiunti, parentAmbiguities);
         res.status(responseStatus).send(responseMessage);
         // Invio email dopo la risposta
         try {
@@ -664,7 +887,12 @@ router.post('/update/', async (req, res) => {
 router.patch('/lightPoints/update/:_id', async (req, res) => {
 
     const _id = req.params._id;
-    const lpToUpdate = req.body;
+    const lpToUpdate = { ...req.body };
+
+    const coordErrors = applyItalianCoordinatesToLightPoint(lpToUpdate);
+    if (coordErrors.length > 0) {
+        return res.status(400).send('Coordinate non valide: ' + coordErrors.join('; '));
+    }
 
     try {
         const updatedLP = await lightPoints.findOneAndUpdate(
@@ -995,8 +1223,10 @@ router.post('/api/downloadExcelTownHall', function (req, res) {
             return aVal.localeCompare(bVal, 'it', { numeric: false, sensitivity: 'base' });
         });
 
+        const enriched = enrichLightPointsWithNumeroPaloParent(sortedPuntiLuce);
+
         // Appiattisci l'oggetto JSON
-        const cleanedJson = sortedPuntiLuce
+        const cleanedJson = enriched
             .map(lp => ({ ...lp, name: jsonData.name }))
             .map(({ segnalazioni_in_corso, segnalazioni_risolte, operazioni_effettuate, name, __v, ...item }) => item)
             .map(item => Object.fromEntries(Object.entries(item).map(([key, value]) => key === '_id' ? [key, value] : [key.toUpperCase(), value])));
@@ -1023,8 +1253,9 @@ router.post('/api/downloadCsvTownHall', function (req, res) {
     const jsonData = req.body;
     // Ordina i punti luce per numero_palo (come stringa)
     const sortedPuntiLuce = [...jsonData.punti_luce].sort(compareNumeroPalo);
+    const enriched = enrichLightPointsWithNumeroPaloParent(sortedPuntiLuce);
     // Appiattisci l'oggetto JSON come per l'XLSX
-    const cleanedJson = sortedPuntiLuce
+    const cleanedJson = enriched
         .map(lp => ({ ...lp, name: jsonData.name }))
         .map(({ segnalazioni_in_corso, segnalazioni_risolte, operazioni_effettuate, name, __v, ...item }) => item)
         .map(item => Object.fromEntries(Object.entries(item).map(([key, value]) => key === '_id' ? [key, value] : [key.toUpperCase(), value])));

@@ -7,6 +7,9 @@ Protette da JWT.
   - Body (estratto):
     - `name`, `region`, `province`, `coordinates: { lat, lng }`, `borders`
     - `light_points: [{ ...campi CSV... }]` — conversione campi gestita.
+      - Supporta `parent` (ObjectId) e `numero_palo_parent` (numero palo del genitore topologico).
+      - Se c’è `numero_palo_parent` ma non un `parent` valido, risolve l’ObjectId cercando nel comune i punti con quel `numero_palo`.
+      - Se la ricerca trova più punti con lo stesso `numero_palo`, il parent non viene impostato e l’ambiguità è segnalata nella mail di esito.
     - `userEmail` (per invio notifica di esito)
   - 200: creato (più email riepilogo successo)
   - 409: comune già esistente
@@ -19,7 +22,7 @@ Protette da JWT.
 - POST `/townHalls/update/`
   - Aggiorna massivamente i punti luce di un comune per nome.
   - Body: `{ name, light_points: [...] , userEmail }`
-  - Normalizza i campi in ingresso, calcola differenze (eliminati/modificati/aggiunti), aggiorna in batch e invia email con Excel allegato (3 fogli: Eliminati, Modificati, Aggiunti).
+  - Normalizza i campi in ingresso (incluso `parent` / `numero_palo_parent`), calcola differenze (eliminati/modificati/aggiunti), aggiorna in batch, risolve i parent da `numero_palo_parent` quando manca l’ObjectId, e invia email con Excel allegato (3 fogli: Eliminati, Modificati, Aggiunti). Le ambiguità su `numero_palo` duplicati sono riportate nella mail.
   - 200: aggiornamento completato
 
 - PATCH `/townHalls/lightPoints/update/:_id`
@@ -47,4 +50,8 @@ Protette da JWT.
 
 - POST `/townHalls/api/downloadExcelTownHall`
   - Body: JSON del comune con `punti_luce` (array).
-  - 200: file Excel generato (punti luce flat e ordinati per `numero_palo`).
+  - 200: file Excel generato (punti luce flat e ordinati per `numero_palo`), con colonne `PARENT` e `NUMERO_PALO_PARENT`.
+
+- POST `/townHalls/api/downloadCsvTownHall`
+  - Body: JSON del comune con `punti_luce` (array).
+  - 200: CSV generato (stesso flattening dell’Excel), con colonne `PARENT` e `NUMERO_PALO_PARENT` (numero palo associato all’id parent).

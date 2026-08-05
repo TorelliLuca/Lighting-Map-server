@@ -21,6 +21,7 @@ const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
 const townHallRoutes = require('./routes/townHalls');
 const lightPointRoutes = require('./routes/lightPoints');
+const topologyRoutes = require('./routes/topology');
 const reportRoutes = require('./routes/reports');
 const operationRoutes = require('./routes/operations');
 const emailRoutes = require('./routes/email');
@@ -101,6 +102,9 @@ app.use('/townHalls', townHallRoutes);
 
 // Light points routes
 app.use('/townHalls/lightPoints', lightPointRoutes);
+
+// Topology (electrical radial network) routes
+app.use('/topology', topologyRoutes);
 
 // Reports routes
 app.use('/', reportRoutes);
