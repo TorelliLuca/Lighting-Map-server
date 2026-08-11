@@ -131,5 +131,6 @@ dist
 .yarn/install-state.gz
 .pnp.*
 generateVAPIDKeys.js
-backup.js
+# Solo dump locali in root; scripts/backup.js resta versionato
+/backup.js
 backup*/
