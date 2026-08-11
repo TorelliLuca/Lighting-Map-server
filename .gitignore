@@ -138,3 +138,5 @@ uploads/email-assets/*
 backup_*/
 backup_*
 .env.*
+# Solo dump locali in root; scripts/backup.js resta versionato
+/backup.js
