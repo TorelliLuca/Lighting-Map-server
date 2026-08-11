@@ -121,7 +121,24 @@ router.post('/login', async function (req, res) {
                 user_type: user.user_type,
                 sub_role: user.sub_role || null,
                 town_halls_list: user.town_halls_list,
-                id_organization: user.id_organization
+                id_organization: user.id_organization,
+                preferences: user.preferences
+                    ? {
+                        onboardingCompleted: Boolean(user.preferences.onboardingCompleted),
+                        onboardingCompletedAt: user.preferences.onboardingCompletedAt || null,
+                        lastSeenWhatsNewId: user.preferences.lastSeenWhatsNewId || null,
+                        seenPageTours: user.preferences.seenPageTours
+                            ? (typeof user.preferences.seenPageTours.entries === 'function'
+                                ? Object.fromEntries(user.preferences.seenPageTours.entries())
+                                : { ...user.preferences.seenPageTours })
+                            : {},
+                    }
+                    : {
+                        onboardingCompleted: false,
+                        onboardingCompletedAt: null,
+                        lastSeenWhatsNewId: null,
+                        seenPageTours: {},
+                    },
             },
             token
         });

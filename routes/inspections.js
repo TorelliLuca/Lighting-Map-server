@@ -12,7 +12,12 @@ const { getAllPuntiLuce } = require('../utils/lightPointHelpers');
 const { STAFF_ROLES, requireRole, requireTownHallAccess } = require('../utils/roles');
 const { transitionReportStatus, resolvePlantContext } = require('../utils/reportHelpers');
 const { appendStatusHistory } = require('../utils/statusHistory');
-const { createNotifications, notifyTownHallStaff, safeNotify } = require('../utils/notificationHelpers');
+const {
+    createNotifications,
+    notifyTownHallStaff,
+    safeNotify,
+    buildLightPointDashboardUrl,
+} = require('../utils/notificationHelpers');
 const { sendConfiguredEmail } = require('../utils/mailEngine');
 const { computeQuoteTotals } = require('../utils/quoteDocuments');
 const logAccess = require('../utils/accessLogger');
@@ -189,7 +194,7 @@ router.post('/', requireRole('MAINTAINER', 'SUPER_ADMIN', 'ADMINISTRATOR'), asyn
             );
         } else if (outcome === 'SCHEDULED') {
             // Scadenza dai termini capitolato: giorni materiale + giorni opera
-            const config = await MaintenanceConfig.findOne({ townHallId: th._id }).session(session);
+            const config = await MaintenanceConfig.findOne({ townHallId: th._id, status: 'active' }).session(session);
             const riskCode = report.risk_class || 'C';
             const riskCfg = (config?.riskClasses || []).find((r) => r.code === riskCode);
             const materialDays = Number(riskCfg?.defaultMaterialDays) || 0;
@@ -264,7 +269,7 @@ router.post('/', requireRole('MAINTAINER', 'SUPER_ADMIN', 'ADMINISTRATOR'), asyn
             puntoLuceDoc.segnalazioni_in_corso.push(extraordinaryReport);
 
             // 3) Bozza IMS collegata (compilabile subito o in seguito)
-            const config = await MaintenanceConfig.findOne({ townHallId: th._id }).session(session);
+            const config = await MaintenanceConfig.findOne({ townHallId: th._id, status: 'active' }).session(session);
             const riskCode = report.risk_class || 'C';
             const riskCfg = (config?.riskClasses || []).find((r) => r.code === riskCode);
             const totals = computeQuoteTotals([], 0.02, 0);
@@ -352,13 +357,27 @@ router.post('/', requireRole('MAINTAINER', 'SUPER_ADMIN', 'ADMINISTRATOR'), asyn
         await session.commitTransaction();
         session.endSession();
 
+        const dashboardUrl = buildLightPointDashboardUrl({
+            townHallName: name,
+            numeroPalo: numero_palo,
+            lat: puntoLuceDoc.lat,
+            lng: puntoLuceDoc.lng,
+        });
+        const plMeta = {
+            townHallName: name,
+            numeroPalo: numero_palo,
+            lat: puntoLuceDoc.lat || null,
+            lng: puntoLuceDoc.lng || null,
+            reportId: String(report._id),
+        };
+
         await safeNotify(() =>
             notifyTownHallStaff(name, {
                 title: `Sopralluogo completato — ${numero_palo}`,
                 body: `Esito: ${outcome}${notes ? ` — ${notes}` : ''}`,
                 type: 'INSPECTION_COMPLETED',
-                url: '/dashboard',
-                meta: { reportId: String(report._id), outcome },
+                url: dashboardUrl,
+                meta: { ...plMeta, outcome },
             })
         );
 
@@ -382,7 +401,8 @@ router.post('/', requireRole('MAINTAINER', 'SUPER_ADMIN', 'ADMINISTRATOR'), asyn
                     title: 'Classificazione segnalazione aggiornata',
                     body: `Il manutentore ha modificato la classificazione sul punto ${numero_palo}.`,
                     type: 'CLASSIFICATION_CONFIRMED',
-                    url: '/dashboard',
+                    url: dashboardUrl,
+                    meta: plMeta,
                 })
             );
             try {

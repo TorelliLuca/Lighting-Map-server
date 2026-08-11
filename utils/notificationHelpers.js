@@ -1,7 +1,11 @@
 const Notification = require('../schemas/notifications');
 const users = require('../schemas/users');
 const townHalls = require('../schemas/townHalls');
-const { STAFF_ROLES } = require('./pushHelpers');
+const {
+  STAFF_ROLES,
+  sendToSubscriptions,
+  getActiveSubscriptionsForUserIds,
+} = require('./pushHelpers');
 
 /**
  * Normalizza un valore in array di email uniche (stringhe non vuote).
@@ -9,6 +13,32 @@ const { STAFF_ROLES } = require('./pushHelpers');
 function normalizeEmails(emails) {
   const list = Array.isArray(emails) ? emails : [emails];
   return [...new Set(list.filter((e) => typeof e === 'string' && e.trim()).map((e) => e.trim()))];
+}
+
+/**
+ * Path frontend (senza origin) per aprire la Dashboard con focus one-shot sul PL.
+ * @example
+ * buildLightPointDashboardUrl({ townHallName: 'Roma', numeroPalo: '12', lat: '41.9', lng: '12.5' })
+ * // → '/dashboard?comune=Roma&focusPalo=12&focusLat=41.9&focusLng=12.5'
+ */
+function buildLightPointDashboardUrl({ townHallName, numeroPalo, lat, lng } = {}) {
+  const params = new URLSearchParams();
+  if (townHallName) params.set('comune', String(townHallName));
+  if (numeroPalo != null && numeroPalo !== '') params.set('focusPalo', String(numeroPalo));
+  if (lat != null && lat !== '') params.set('focusLat', String(lat));
+  if (lng != null && lng !== '') params.set('focusLng', String(lng));
+  const qs = params.toString();
+  return qs ? `/dashboard?${qs}` : '/dashboard';
+}
+
+/**
+ * URL assoluto per Web Push (FRONTEND_URL + path relativo).
+ */
+function toFrontendAbsoluteUrl(path) {
+  const base = String(process.env.FRONTEND_URL || '').replace(/\/$/, '');
+  if (!path) return base || '/';
+  const normalized = path.startsWith('/') ? path : `/${path}`;
+  return base ? `${base}${normalized}` : normalized;
 }
 
 /**
@@ -67,6 +97,42 @@ async function createNotifications(userIds, { title, body, type = 'GENERIC', url
 }
 
 /**
+ * Invia Web Push agli stessi utenti di una notifica in-app (subscription attive).
+ * `url` può essere path relativo (`/quote/…`) — viene reso assoluto con FRONTEND_URL.
+ */
+async function sendPushToUserIds(userIds, { title, body, url = null } = {}) {
+  const ids = [...new Set((userIds || []).filter(Boolean).map((id) => String(id)))];
+  if (ids.length === 0 || !title) return { success: 0, fail: 0, failed: [], successed: [] };
+
+  const subs = await getActiveSubscriptionsForUserIds(ids);
+  if (!subs.length) return { success: 0, fail: 0, failed: [], successed: [] };
+
+  return sendToSubscriptions(subs, {
+    title,
+    body: body || '',
+    url: toFrontendAbsoluteUrl(url),
+  });
+}
+
+/**
+ * Notifica in-app + Web Push (stesso titolo/body/url) per un elenco di userId.
+ */
+async function notifyUsersWithPush(userIds, payload) {
+  const created = await createNotifications(userIds, payload);
+  const ids = [...new Set((userIds || []).filter(Boolean).map((id) => String(id)))];
+  try {
+    await sendPushToUserIds(ids, {
+      title: payload.title,
+      body: payload.body,
+      url: payload.url,
+    });
+  } catch (err) {
+    console.error('[notifications] push:', err.message || err);
+  }
+  return created;
+}
+
+/**
  * Risolve email → userId e crea le notifiche.
  * @example
  * await createNotificationsForEmails('admin@x.it', { title, body, type: 'UPLOAD_SUCCESS' });
@@ -122,6 +188,10 @@ module.exports = {
   createNotifications,
   createNotificationsForEmails,
   notifyTownHallStaff,
+  notifyUsersWithPush,
+  sendPushToUserIds,
+  buildLightPointDashboardUrl,
+  toFrontendAbsoluteUrl,
   findStaffUsersForTownHall,
   safeNotify,
   normalizeEmails,

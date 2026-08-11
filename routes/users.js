@@ -19,6 +19,33 @@ function normalizeSubRole(userType, subRoleRaw) {
     return null;
 }
 
+function serializePreferences(prefs) {
+    const raw = prefs || {};
+    let seenPageTours = {};
+    if (raw.seenPageTours) {
+        if (typeof raw.seenPageTours.entries === 'function') {
+            seenPageTours = Object.fromEntries(raw.seenPageTours.entries());
+        } else if (typeof raw.seenPageTours === 'object') {
+            seenPageTours = { ...raw.seenPageTours };
+        }
+    }
+    return {
+        onboardingCompleted: Boolean(raw.onboardingCompleted),
+        onboardingCompletedAt: raw.onboardingCompletedAt || null,
+        lastSeenWhatsNewId: raw.lastSeenWhatsNewId || null,
+        seenPageTours,
+    };
+}
+
+function defaultPreferences() {
+    return {
+        onboardingCompleted: false,
+        onboardingCompletedAt: null,
+        lastSeenWhatsNewId: null,
+        seenPageTours: {},
+    };
+}
+
 // User validation
 router.post('/validateUser', async (req, res) => {
     const usrType = req.body.user_type
@@ -297,17 +324,95 @@ router.get('/getForEmail/:email', async function (req, res) {
 router.get('/profile', accessLogger('GET_PROFILE'), async function (req, res) {
     try {
       const userId = req.user.id;
-      
-      const user = await users.findOne({ id: userId });
-      
-      if (user) {
-        res.json({ user });
-      } else {
-        res.status(404).send('User not found');
+
+      const user = await users
+        .findById(userId)
+        .select('-password -resetPasswordToken -resetPasswordExpires')
+        .populate('town_halls_list');
+
+      if (!user) {
+        return res.status(404).send('User not found');
       }
+
+      res.json({
+        user: {
+          id: user._id,
+          name: user.name,
+          surname: user.surname,
+          email: user.email,
+          is_approved: user.is_approved,
+          user_type: user.user_type,
+          sub_role: user.sub_role || null,
+          town_halls_list: user.town_halls_list,
+          id_organization: user.id_organization,
+          emailVerified: user.emailVerified,
+          date: user.date,
+          preferences: serializePreferences(user.preferences),
+        },
+      });
     } catch (err) {
       console.error('Error fetching user profile:', err);
       res.status(500).send('Server error');
+    }
+});
+
+router.post('/me/preferences', accessLogger('UPDATE_PREFERENCES'), async function (req, res) {
+    try {
+        const userId = req.user.id;
+        const body = req.body || {};
+
+        const user = await users.findById(userId);
+        if (!user) {
+            return res.status(404).send('User not found');
+        }
+
+        if (!user.preferences) {
+            user.preferences = defaultPreferences();
+        }
+
+        if (typeof body.onboardingCompleted === 'boolean') {
+            user.preferences.onboardingCompleted = body.onboardingCompleted;
+            if (body.onboardingCompleted) {
+                user.preferences.onboardingCompletedAt =
+                    body.onboardingCompletedAt
+                        ? new Date(body.onboardingCompletedAt)
+                        : new Date();
+            } else if (body.onboardingCompleted === false) {
+                user.preferences.onboardingCompletedAt = null;
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(body, 'lastSeenWhatsNewId')) {
+            user.preferences.lastSeenWhatsNewId =
+                body.lastSeenWhatsNewId == null
+                    ? null
+                    : String(body.lastSeenWhatsNewId);
+        }
+
+        if (body.seenPageTours && typeof body.seenPageTours === 'object') {
+            if (!user.preferences.seenPageTours) {
+                user.preferences.seenPageTours = new Map();
+            }
+            for (const [pageId, seen] of Object.entries(body.seenPageTours)) {
+                if (!pageId || typeof pageId !== 'string') continue;
+                const key = pageId.slice(0, 64);
+                if (user.preferences.seenPageTours.set) {
+                    user.preferences.seenPageTours.set(key, Boolean(seen));
+                } else {
+                    user.preferences.seenPageTours[key] = Boolean(seen);
+                }
+            }
+        }
+
+        user.markModified('preferences');
+        await user.save();
+
+        res.json({
+            preferences: serializePreferences(user.preferences),
+        });
+    } catch (err) {
+        console.error('Error updating user preferences:', err);
+        res.status(500).send('Server error');
     }
 });
 

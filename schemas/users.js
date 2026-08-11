@@ -21,7 +21,13 @@ const schema = new Schema({
     resetPasswordExpires: {type: Date, default: null},
     id_organization: {type: Schema.Types.ObjectId, ref: 'organizations', default: null},
     requested_townhall: {type: String, default: null},
-    requested_townhall_notes: {type: String, default: null}
+    requested_townhall_notes: {type: String, default: null},
+    preferences: {
+        onboardingCompleted: { type: Boolean, default: false },
+        onboardingCompletedAt: { type: Date, default: null },
+        lastSeenWhatsNewId: { type: String, default: null },
+        seenPageTours: { type: Map, of: Boolean, default: {} },
+    },
 })
 
 schema.pre('save', async function(next) {

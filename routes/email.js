@@ -1,7 +1,12 @@
 const express = require('express');
 const townHalls = require('../schemas/townHalls');
 const users = require('../schemas/users');
-const { createNotifications, createNotificationsForEmails, safeNotify } = require('../utils/notificationHelpers');
+const {
+    createNotifications,
+    createNotificationsForEmails,
+    safeNotify,
+    buildLightPointDashboardUrl,
+} = require('../utils/notificationHelpers');
 const { sendConfiguredEmail } = require('../utils/mailEngine');
 
 const router = express.Router();
@@ -44,11 +49,19 @@ router.post('/send-email-to-user/lightPointReported', async (req, res) => {
     const destinationIds = destination.map((u) => u._id);
 
     const numeroPalo = req.body.light_point?.numero_palo || '';
+    const lat = req.body.light_point?.lat;
+    const lng = req.body.light_point?.lng;
     const user = req.body.user || {};
     const report = req.body.report || {};
     const dateLabel = req.body.date
         ? new Date(req.body.date).toLocaleDateString('it-IT')
         : new Date().toLocaleDateString('it-IT');
+    const dashboardUrl = buildLightPointDashboardUrl({
+        townHallName: req.body.name,
+        numeroPalo,
+        lat,
+        lng,
+    });
 
     await sendConfiguredEmail('REPORT_CREATED', {
         townHallId: th._id,
@@ -72,10 +85,12 @@ router.post('/send-email-to-user/lightPointReported', async (req, res) => {
             title: `Segnalazione su punto ${numeroPalo}`,
             body: `${report.report_type || 'Guasto'} — ${req.body.name}${report.description ? `: ${report.description}` : ''}`,
             type: 'REPORT_CREATED',
-            url: '/dashboard',
+            url: dashboardUrl,
             meta: {
                 townHallName: req.body.name,
                 numeroPalo,
+                lat: lat || null,
+                lng: lng || null,
                 reportType: report.report_type,
             },
         })
@@ -95,11 +110,19 @@ router.post('/send-email-to-user/reportSolved', async (req, res) => {
     const destinationIds = destination.map((u) => u._id);
 
     const numeroPalo = req.body.light_point?.numero_palo || '';
+    const lat = req.body.light_point?.lat ?? req.body.lat;
+    const lng = req.body.light_point?.lng ?? req.body.lng;
     const user = req.body.user || {};
     const operation = req.body.operation || {};
     const dateLabel = req.body.date
         ? new Date(req.body.date).toLocaleDateString('it-IT')
         : new Date().toLocaleDateString('it-IT');
+    const dashboardUrl = buildLightPointDashboardUrl({
+        townHallName: req.body.name,
+        numeroPalo,
+        lat,
+        lng,
+    });
 
     await sendConfiguredEmail('REPORT_SOLVED', {
         townHallId: th._id,
@@ -123,10 +146,12 @@ router.post('/send-email-to-user/reportSolved', async (req, res) => {
             title: `Operazione su punto ${numeroPalo}`,
             body: `${operation.operation_type || 'Intervento'} — ${req.body.name}${operation.description ? `: ${operation.description}` : ''}`,
             type: 'REPORT_SOLVED',
-            url: '/dashboard',
+            url: dashboardUrl,
             meta: {
                 townHallName: req.body.name,
                 numeroPalo,
+                lat: lat || null,
+                lng: lng || null,
                 operationType: operation.operation_type,
             },
         })

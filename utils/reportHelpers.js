@@ -1,7 +1,7 @@
 const lightPoints = require('../schemas/lightPoints');
 const townHalls = require('../schemas/townHalls');
 const users = require('../schemas/users');
-const { createNotifications, safeNotify } = require('./notificationHelpers');
+const { createNotifications, safeNotify, buildLightPointDashboardUrl } = require('./notificationHelpers');
 const { sendConfiguredEmail } = require('./mailEngine');
 const { appendStatusHistory } = require('./statusHistory');
 
@@ -91,6 +91,12 @@ async function notifyReportCreated({
     const reportLabel = getFaultLabelDisplay(report.fault_label, report.report_type);
     const numeroPalo = lightPoint?.numero_palo || '';
     const dateLabel = new Date(report.report_date || Date.now()).toLocaleDateString('it-IT');
+    const dashboardUrl = buildLightPointDashboardUrl({
+        townHallName,
+        numeroPalo,
+        lat: lightPoint?.lat,
+        lng: lightPoint?.lng,
+    });
 
     await sendConfiguredEmail('REPORT_CREATED', {
         townHallId: th._id,
@@ -116,10 +122,12 @@ async function notifyReportCreated({
                 title: `Segnalazione su punto ${numeroPalo}`,
                 body: `${reportLabel} — ${townHallName}${report.description ? `: ${report.description}` : ''}`,
                 type: 'REPORT_CREATED',
-                url: '/dashboard',
+                url: dashboardUrl,
                 meta: {
                     townHallName,
                     numeroPalo,
+                    lat: lightPoint?.lat || null,
+                    lng: lightPoint?.lng || null,
                     reportId: String(report._id),
                     maintenanceCategory: report.maintenance_category,
                 },

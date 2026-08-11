@@ -19,6 +19,10 @@ const {
     applyItalianCoordinatesToLightPoint,
     parseCoordValue
 } = require('../utils/utility');
+const {
+    normalizeLightPointData,
+    previewLightPointsImport
+} = require('../utils/lightPointCsv');
 const { createNotificationsForEmails, safeNotify } = require('../utils/notificationHelpers');
 
 const router = express.Router();
@@ -137,6 +141,11 @@ const LIGHT_POINT_FULL_POPULATE = [
                 select: 'name surname email',
             },
             {
+                path: 'user_responsible_id',
+                model: 'users',
+                select: 'name surname email',
+            },
+            {
                 path: 'linked_quote_id',
                 model: 'quotes',
                 select: 'protocolNumber status type total dueDate',
@@ -154,6 +163,10 @@ const LIGHT_POINT_FULL_POPULATE = [
             path: 'user_responsible_id',
             model: 'users',
             select: 'name surname email'
+        }, {
+            path: 'linked_quote_id',
+            model: 'quotes',
+            select: 'protocolNumber status type total dueDate',
         }]
     },
     {
@@ -260,6 +273,9 @@ router.post('/', async (req, res) => {
         }
 
         // Crea il comune senza punti luce
+        const bordersId = req.body.borders && String(req.body.borders).trim()
+            ? req.body.borders
+            : undefined;
         const th = await townHalls.create([{
             name: req.body.name,
             region: req.body.region,
@@ -268,7 +284,7 @@ router.post('/', async (req, res) => {
                 lat: req.body.coordinates?.lat,
                 lng: req.body.coordinates?.lng
             },
-            borders: req.body.borders
+            ...(bordersId ? { borders: bordersId } : {})
         }], { session });
 
         
@@ -320,6 +336,8 @@ router.post('/', async (req, res) => {
             }
 
             const lightPointsData = prepared.map(p => {
+                // In creazione: sempre nuovi ObjectId (evita CastError su _id vuoto e duplicate key da export)
+                delete p.doc._id;
                 // In creazione parent assente → null esplicito (default schema)
                 if (!Object.prototype.hasOwnProperty.call(p.doc, 'parent')) {
                     p.doc.parent = null;
@@ -342,6 +360,7 @@ router.post('/', async (req, res) => {
                     allInserted.push(...inserted);
                     batchStatus.push({ batch: batchIndex + 1, status: 'ok' });
                 } catch (batchErr) {
+                    console.error(`Errore insertMany batch ${batchIndex + 1}:`, batchErr);
                     let markerErrore = null;
                     if (batch && batch.length > 0) {
                         markerErrore = batch[0].marker;
@@ -367,7 +386,10 @@ router.post('/', async (req, res) => {
                     `;
 
                     isError = true;
-                    res.status(responseStatus).send(responseMessage);
+                    res.status(responseStatus).json({
+                        error: responseMessage,
+                        detail: batchErr?.message || String(batchErr)
+                    });
                     // Invia mail dopo la risposta
                     try {
                         const adminEmails = req.body.userEmail;
@@ -412,7 +434,12 @@ router.post('/', async (req, res) => {
         await session.commitTransaction();
         session.endSession();
         mailHtml = returnHtmlEmailUploadSuccess(req.body.name, batchStatus, parentAmbiguities);
-        res.status(responseStatus).send(responseMessage);
+        res.status(responseStatus).json({
+            message: responseMessage,
+            _id: th[0]._id,
+            name: th[0].name,
+            light_points: puntiLuceIds.length
+        });
         // Invia mail dopo la risposta
         try {
             const adminEmails = req.body.userEmail;
@@ -430,14 +457,22 @@ router.post('/', async (req, res) => {
             debugMail('Errore nell\'invio email di notifica:', e);
         }
     } catch (err) {
-        await session.abortTransaction();
-        session.endSession();
+        console.error('Errore creazione comune:', err);
+        try {
+            await session.abortTransaction();
+            session.endSession();
+        } catch (sessionErr) {
+            console.error('Errore chiusura sessione create:', sessionErr);
+        }
         responseStatus = 500;
         responseMessage = 'Errore durante il caricamento';
         mailSubject = 'Errore durante il caricamento';
         mailHtml = returnHtmlEmailUploadError(req.body.name, err?.message || '');
         isError = true;
-        res.status(responseStatus).send(responseMessage);
+        res.status(responseStatus).json({
+            error: responseMessage,
+            detail: err?.message || String(err)
+        });
         // Invia mail dopo la risposta
         try {
             const adminEmails = req.body.userEmail;
@@ -535,55 +570,39 @@ function returnHtmlEmailUpdateSuccessSummary(nomeComune, eliminati, modificati, 
     `;
 }
 
-// Funzione di normalizzazione robusta per i dati dei punti luce
-function normalizeLightPointData(lp) {
-    // Porta tutte le chiavi a minuscolo
-    const lowerCaseLp = {};
-    Object.keys(lp).forEach(key => {
-        lowerCaseLp[key.toLowerCase()] = lp[key];
-    });
-
-    const allowedFields = [
-        'marker', 'numero_palo', 'composizione_punto', 'indirizzo', 'lotto', 'quadro', 'proprieta',
-        'tipo_apparecchio', 'marca_apparecchio', 'modello_apparecchio', 'numero_apparecchi',
-        'tipo_lampada', 'potenza_lampada', 'tipo_sostegno', 'tipo_linea', 'promiscuita', 'note', 'garanzia',
-        'lat', 'lng', 'pod', 'numero_contatore', 'alimentazione', 'potenza_contratto', 'potenza', 'punti_luce', 'tipo',
-        'altezza_sostegno', 'data_creazione',
-        'parent',
-        '_id',
-        'segnalazioni_in_corso', 'segnalazioni_risolte', 'operazioni_effettuate'
-    ];
-
-    const normalized = {};
-    for (const key of allowedFields) {
-        if (Object.prototype.hasOwnProperty.call(lowerCaseLp, key)) {
-            normalized[key] = lowerCaseLp[key];
+/**
+ * Dry-run import CSV: anteprima colonne/righe accettate vs scartate (senza scrivere).
+ * Body: { light_points: [...], mode: 'create'|'update', name? }
+ */
+router.post('/preview-import', async (req, res) => {
+    try {
+        const lightPoints = req.body?.light_points;
+        if (!Array.isArray(lightPoints)) {
+            return res.status(400).json({ error: 'light_points deve essere un array' });
         }
-    }
 
-    // Campo solo CSV: numero palo del parent (risolto a ObjectId in un secondo passaggio)
-    if (Object.prototype.hasOwnProperty.call(lowerCaseLp, 'numero_palo_parent')) {
-        normalized.numero_palo_parent = lowerCaseLp.numero_palo_parent;
-    }
+        const mode = req.body?.mode === 'update' ? 'update' : 'create';
+        let existingIds = [];
 
-    // Migrazione alias CSV legacy → schema aggiornato
-    if (!normalized.modello_apparecchio && lowerCaseLp.modello) {
-        normalized.modello_apparecchio = lowerCaseLp.modello;
-    }
-    const legacyLampada = lowerCaseLp.lampada_e_potenza || lowerCaseLp.lampada_potenza;
-    if (legacyLampada && (!normalized.tipo_lampada || !normalized.potenza_lampada)) {
-        const parts = String(legacyLampada).trim().split(/\s+/);
-        if (!normalized.tipo_lampada) {
-            normalized.tipo_lampada = parts[0] || '';
+        if (mode === 'update') {
+            const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+            if (!name) {
+                return res.status(400).json({ error: 'name è obbligatorio in modalità update' });
+            }
+            const th = await townHalls.findOne({ name }).select('punti_luce').lean();
+            if (!th) {
+                return res.status(404).json({ error: 'Comune non trovato' });
+            }
+            existingIds = (th.punti_luce || []).map(id => String(id));
         }
-        if (!normalized.potenza_lampada) {
-            normalized.potenza_lampada = parts.slice(1).join(' ') || '';
-        }
+
+        const preview = previewLightPointsImport(lightPoints, { mode, existingIds });
+        return res.json(preview);
+    } catch (err) {
+        console.error('Errore preview-import:', err);
+        return res.status(500).json({ error: 'Errore durante l\'anteprima del CSV' });
     }
-
-    return normalized;
-}
-
+});
 
 router.post('/update/', async (req, res) => {
     const session = await mongoose.startSession();

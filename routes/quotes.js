@@ -5,13 +5,13 @@ const reports = require('../schemas/reports');
 const light_points = require('../schemas/lightPoints');
 const townHalls = require('../schemas/townHalls');
 const users = require('../schemas/users');
-const MaintenanceConfig = require('../schemas/maintenanceConfig');
+const { findActiveConfig } = require('../utils/maintenanceConfigHelpers');
 const { STAFF_ROLES, requireRole, requireTownHallAccess, isSuperAdmin, canAccessTownHall } = require('../utils/roles');
 const { appendStatusHistory } = require('../utils/statusHistory');
 const { transitionReportStatus, resolvePlantContext } = require('../utils/reportHelpers');
 const { nextSequentialNumber } = require('../utils/sequentialNumbers');
 const { computeQuoteTotals, fillImsWorkbook, toPdf, quoteDocumentCode } = require('../utils/quoteDocuments');
-const { createNotifications, safeNotify } = require('../utils/notificationHelpers');
+const { notifyUsersWithPush, safeNotify } = require('../utils/notificationHelpers');
 const { sendConfiguredEmail } = require('../utils/mailEngine');
 const logAccess = require('../utils/accessLogger');
 
@@ -317,7 +317,7 @@ router.post('/', requireRole('MAINTAINER', 'SUPER_ADMIN'), async (req, res) => {
             }
         }
 
-        const config = await MaintenanceConfig.findOne({ townHallId: th._id });
+        const config = await findActiveConfig(th._id);
         const minDiscountPercent = getMinimumDiscountPercent(config);
         const riskCode = priorityClass || report?.risk_class || 'C';
         const riskCfg = (config?.riskClasses || []).find((r) => r.code === riskCode);
@@ -444,7 +444,7 @@ router.patch('/:id', requireRole('MAINTAINER', 'SUPER_ADMIN'), async (req, res) 
             notes,
         } = req.body || {};
 
-        const config = await MaintenanceConfig.findOne({ townHallId: quote.townHallId });
+        const config = await findActiveConfig(quote.townHallId);
         const minDiscountPercent = getMinimumDiscountPercent(config);
 
         if (priorityClass) quote.priorityClass = priorityClass;
@@ -575,7 +575,7 @@ router.post('/:id/submit', requireRole('MAINTAINER', 'SUPER_ADMIN'), async (req,
             return res.status(400).json({ error: 'Aggiungere almeno una voce di materiale' });
         }
 
-        const config = await MaintenanceConfig.findOne({ townHallId: quote.townHallId });
+        const config = await findActiveConfig(quote.townHallId);
         const minDiscountPercent = getMinimumDiscountPercent(config);
         applyTotals(
             quote,
@@ -597,7 +597,7 @@ router.post('/:id/submit', requireRole('MAINTAINER', 'SUPER_ADMIN'), async (req,
         const admins = await getTownHallAdmins(quote.townHallId);
         if (quote.type === 'CONSUNTIVO') {
             await safeNotify(() =>
-                createNotifications(
+                notifyUsersWithPush(
                     admins.map((a) => a._id),
                     {
                         title: 'Consuntivo in approvazione',
@@ -618,7 +618,7 @@ router.post('/:id/submit', requireRole('MAINTAINER', 'SUPER_ADMIN'), async (req,
             });
         } else {
             await safeNotify(() =>
-                createNotifications(
+                notifyUsersWithPush(
                     admins.map((a) => a._id),
                     {
                         title: 'Preventivo in approvazione',
@@ -721,7 +721,7 @@ router.post('/:id/approve', requireRole('ADMINISTRATOR', 'SUPER_ADMIN'), async (
 
             const maintainerId = quote.assignedMaintainer || quote.createdBy;
             await safeNotify(() =>
-                createNotifications([maintainerId], {
+                notifyUsersWithPush([maintainerId], {
                     title: `Consuntivo ${seq.formatted} approvato`,
                     body: `Totale € ${quote.total.toFixed(2)} (preventivo € ${Number(parent.total || 0).toFixed(2)})`,
                     type: 'CONSUNTIVO_FINALIZED',
@@ -863,7 +863,7 @@ router.post('/:id/approve', requireRole('ADMINISTRATOR', 'SUPER_ADMIN'), async (
 
         const maintainerId = quote.assignedMaintainer || quote.createdBy;
         await safeNotify(() =>
-            createNotifications([maintainerId], {
+            notifyUsersWithPush([maintainerId], {
                 title: `Preventivo ${seq.formatted} approvato`,
                 body: `Scadenza intervento: ${dueDate.toLocaleDateString('it-IT')}`,
                 type: 'QUOTE_APPROVED',
@@ -960,7 +960,7 @@ router.post('/:id/reject', requireRole('ADMINISTRATOR', 'SUPER_ADMIN'), async (r
 
             const maintainerId = quote.assignedMaintainer || quote.createdBy;
             await safeNotify(() =>
-                createNotifications([maintainerId], {
+                notifyUsersWithPush([maintainerId], {
                     title: 'Consuntivo da revisionare',
                     body: overallReason,
                     type: 'CONSUNTIVO_REJECTED',
@@ -1029,7 +1029,7 @@ router.post('/:id/reject', requireRole('ADMINISTRATOR', 'SUPER_ADMIN'), async (r
 
         const maintainerId = quote.assignedMaintainer || quote.createdBy;
         await safeNotify(() =>
-            createNotifications([maintainerId], {
+            notifyUsersWithPush([maintainerId], {
                 title: 'Preventivo da revisionare',
                 body: overallReason,
                 type: 'QUOTE_REJECTED',
@@ -1202,7 +1202,7 @@ router.post('/:id/finalize-consuntivo', requireRole('MAINTAINER', 'SUPER_ADMIN')
             return res.status(400).json({ error: 'Preventivo di origine non trovato' });
         }
 
-        const config = await MaintenanceConfig.findOne({ townHallId: consuntivo.townHallId });
+        const config = await findActiveConfig(consuntivo.townHallId);
         const minDiscountPercent = getMinimumDiscountPercent(config);
         applyTotals(
             consuntivo,
@@ -1222,7 +1222,7 @@ router.post('/:id/finalize-consuntivo', requireRole('MAINTAINER', 'SUPER_ADMIN')
 
         const admins = await getTownHallAdmins(consuntivo.townHallId);
         await safeNotify(() =>
-            createNotifications(
+            notifyUsersWithPush(
                 admins.map((a) => a._id),
                 {
                     title: 'Consuntivo in approvazione',
@@ -1270,7 +1270,7 @@ async function buildDocumentContext(quote) {
     const [report, lightPoint, config, th, approver, parentQuote] = await Promise.all([
         quote.reportId ? reports.findById(quote.reportId) : null,
         light_points.findById(quote.lightPointId),
-        MaintenanceConfig.findOne({ townHallId: quote.townHallId }),
+        findActiveConfig(quote.townHallId),
         townHalls.findById(quote.townHallId).select('name'),
         quote.approvedBy
             ? users.findById(quote.approvedBy).select('name surname')

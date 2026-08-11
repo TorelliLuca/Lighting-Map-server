@@ -24,8 +24,16 @@ const materialCatalogItemSchema = new Schema({
     isStandard: { type: Boolean, default: true },
 }, { _id: false });
 
+const CAPITOLATO_STATUSES = ['active', 'draft', 'archived'];
+
 const schema = new Schema({
-    townHallId: { type: Schema.Types.ObjectId, ref: 'townHalls', required: true, unique: true },
+    townHallId: { type: Schema.Types.ObjectId, ref: 'townHalls', required: true },
+    status: {
+        type: String,
+        enum: CAPITOLATO_STATUSES,
+        default: 'active',
+        required: true,
+    },
     capitolatoVersion: { type: String, default: '2026 Rev00' },
     minDiscountPercent: { type: Number, default: 0, min: 0, max: 100 },
     validFrom: { type: Date, default: Date.now },
@@ -43,6 +51,23 @@ const schema = new Schema({
     timestamps: true,
 });
 
-
+schema.index({ townHallId: 1, status: 1 });
+schema.index(
+    { townHallId: 1 },
+    {
+        unique: true,
+        partialFilterExpression: { status: 'active' },
+        name: 'unique_active_per_townHall',
+    }
+);
+schema.index(
+    { townHallId: 1 },
+    {
+        unique: true,
+        partialFilterExpression: { status: 'draft' },
+        name: 'unique_draft_per_townHall',
+    }
+);
 
 module.exports = model('maintenanceConfigs', schema);
+module.exports.CAPITOLATO_STATUSES = CAPITOLATO_STATUSES;

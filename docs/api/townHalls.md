@@ -19,6 +19,16 @@ Protette da JWT.
   - Rimuove il comune, i punti luce associati e pulisce i riferimenti su utenti.
   - 200: conferma rimozione
 
+- POST `/townHalls/preview-import`
+  - Dry-run dell’import CSV (nessuna scrittura DB): stessa normalizzazione di create/update.
+  - Body: `{ light_points: [...], mode: "create"|"update", name? }`
+    - In `mode: "update"` è obbligatorio `name` (per conteggiare aggiunti/modificati/eliminati rispetto agli ID esistenti).
+  - 200 JSON:
+    - `columns`: `recognized`, `ignored` (colonna + motivo), `legacyMapped` (es. `modello` → `modello_apparecchio`)
+    - `summary`: totali, accettati, vuote saltate, coordinate invalide; in update anche `toAdd` / `toModify` / `toDelete`
+    - `accepted` (max 50), `rejected` (riga + motivi), `warnings` (es. lat/lng mancanti, non bloccanti), `canProceed`, `blockers`, `notices`
+  - 400: body non valido; 404: comune non trovato (update)
+
 - POST `/townHalls/update/`
   - Aggiorna massivamente i punti luce di un comune per nome.
   - Body: `{ name, light_points: [...] , userEmail }`
