@@ -130,6 +130,11 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
-generateVAPIDKeys.js
-backup.js
-backup*/
+# Uploaded email template images
+uploads/email-assets/*
+!uploads/email-assets/.gitkeep
+
+# Local production backup dumps (non committare)
+backup_*/
+backup_*
+.env.*

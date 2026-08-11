@@ -8,9 +8,11 @@ const { getAllPuntiLuce } = require('../utils/lightPointHelpers');
 const accessLogger = require('../middleware/accessLogger');
 const logAccess = require('../utils/accessLogger');
 const reports = require('../schemas/reports');
+const { transitionReportStatus } = require('../utils/reportHelpers');
+const { requireRole } = require('../utils/roles');
 const router = express.Router();    
 
-router.post('/addOperation', async (req, res) => {
+router.post('/addOperation', requireRole('MAINTAINER', 'SUPER_ADMIN'), async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
     try {
@@ -61,6 +63,36 @@ router.post('/addOperation', async (req, res) => {
             session.endSession();
             return res.status(404).send('segnalazione non trovata');
         }
+
+        if (report?.maintenance_category === 'EXTRAORDINARY') {
+            await report.populate({
+                path: 'linked_quote_id',
+                select: 'status protocolNumber type',
+            });
+            const linkedQuote = report.linked_quote_id;
+            if (!linkedQuote || linkedQuote.status !== 'APPROVED') {
+                await session.abortTransaction();
+                session.endSession();
+                return res.status(400).json({
+                    error: 'Il preventivo IMS deve essere approvato dal DEC prima di chiudere la straordinaria',
+                });
+            }
+        }
+
+        // Finché esiste una segnalazione ordinaria senza sopralluogo, niente operazioni sul punto
+        const preInspection = new Set(['OPEN', 'CLASSIFICATION_PENDING']);
+        const needsInspection = (puntoLuce.segnalazioni_in_corso || []).some((s) => {
+            if (!s || s.is_solved) return false;
+            if (s.maintenance_category === 'EXTRAORDINARY') return false;
+            return preInspection.has(s.workflow_status || 'OPEN');
+        });
+        if (needsInspection) {
+            await session.abortTransaction();
+            session.endSession();
+            return res.status(400).json({
+                error: 'Completare prima il sopralluogo: l\'operazione non è consentita su punti con segnalazione non ispezionata',
+            });
+        }
         
         const fakeReport = {
             _id: new mongoose.Types.ObjectId(),
@@ -81,6 +113,13 @@ router.post('/addOperation', async (req, res) => {
         if (req.body.is_solved && report) {
             report.is_solved = true;
             report.user_responsible_id = user._id;
+            // Chiusura workflow (es. ripresa dopo sospensione)
+            transitionReportStatus(
+                report,
+                'RESOLVED',
+                user._id,
+                req.body.note || 'Guasto eliminato e impianto ripristinato'
+            );
             await report.save({ session });
             puntoLuce.segnalazioni_in_corso.pull(report);
             puntoLuce.segnalazioni_risolte.push(report);
@@ -113,7 +152,19 @@ router.post('/addOperation', async (req, res) => {
 
         await session.commitTransaction();
         session.endSession();
-        res.send('Operazione aggiunta con successo');
+        res.json({
+            message: 'Operazione aggiunta con successo',
+            operationId: nuovaOperazione._id,
+            report: report
+                ? {
+                    _id: report._id,
+                    maintenance_category: report.maintenance_category,
+                    linked_quote_id: report.linked_quote_id,
+                    workflow_status: report.workflow_status,
+                    is_solved: report.is_solved,
+                }
+                : null,
+        });
     } catch (error) {
         await session.abortTransaction();
         session.endSession();

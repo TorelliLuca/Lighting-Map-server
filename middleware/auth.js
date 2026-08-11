@@ -8,10 +8,15 @@ const authenticateToken = (req, res, next) => {
     if (!token) return res.status(401).send('Accesso negato');
     
     jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-      if (err) return res.status(403).send('Token non valido');
+      if (err) {
+        if (err.name === 'TokenExpiredError') {
+          return res.status(401).send('Token scaduto');
+        }
+        return res.status(403).send('Token non valido');
+      }
       req.user = user;
       next();
     });
 };
 
-module.exports = authenticateToken; 
+module.exports = authenticateToken;

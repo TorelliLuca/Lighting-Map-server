@@ -97,9 +97,22 @@ async function applyResolvedParents(jobs, candidates, session) {
 }
 
 /** Invio email upload/update + notifica in-app allo stesso destinatario. */
-async function sendMailAndNotify(mailOptions, { type, townHallName } = {}) {
-    await transporter.sendMail(mailOptions);
-    const isError = type === 'UPLOAD_ERROR';
+async function sendMailAndNotify(mailOptions, { type, townHallName, detail } = {}) {
+    const { sendConfiguredEmail } = require('../utils/mailEngine');
+    const emails = Array.isArray(mailOptions.to) ? mailOptions.to : [mailOptions.to];
+    const actionKey = type === 'UPLOAD_ERROR' ? 'UPLOAD_ERROR' : 'UPLOAD_SUCCESS';
+    const isError = actionKey === 'UPLOAD_ERROR';
+
+    await sendConfiguredEmail(actionKey, {
+        recipientEmails: emails.filter(Boolean),
+        vars: {
+            nome_comune: townHallName || '',
+            dettaglio: detail || mailOptions.subject || (isError
+                ? `Si è verificato un errore sul comune ${townHallName || ''}.`
+                : `Operazione completata sul comune ${townHallName || ''}.`),
+        },
+    });
+
     await safeNotify(() =>
         createNotificationsForEmails(mailOptions.to, {
             title: mailOptions.subject || (isError ? 'Errore caricamento' : 'Caricamento completato'),
@@ -117,11 +130,18 @@ const LIGHT_POINT_FULL_POPULATE = [
     {
         path: 'segnalazioni_in_corso',
         model: 'reports',
-        populate: {
-            path: 'user_creator_id',
-            model: 'users',
-            select: 'name surname email'
-        }
+        populate: [
+            {
+                path: 'user_creator_id',
+                model: 'users',
+                select: 'name surname email',
+            },
+            {
+                path: 'linked_quote_id',
+                model: 'quotes',
+                select: 'protocolNumber status type total dueDate',
+            },
+        ],
     },
     {
         path: 'segnalazioni_risolte',
@@ -158,7 +178,15 @@ const LIGHT_POINT_FULL_POPULATE = [
 ];
 
 const GEOJSON_LIGHT_POINT_POPULATE = [
-    { path: 'segnalazioni_in_corso', model: 'reports' },
+    {
+        path: 'segnalazioni_in_corso',
+        model: 'reports',
+        populate: {
+            path: 'linked_quote_id',
+            model: 'quotes',
+            select: 'protocolNumber status type total dueDate',
+        },
+    },
     { path: 'segnalazioni_risolte', model: 'reports' },
     {
         path: 'operazioni_effettuate',
@@ -517,7 +545,7 @@ function normalizeLightPointData(lp) {
 
     const allowedFields = [
         'marker', 'numero_palo', 'composizione_punto', 'indirizzo', 'lotto', 'quadro', 'proprieta',
-        'tipo_apparecchio', 'armatura', 'marca_apparecchio', 'modello_apparecchio', 'numero_apparecchi',
+        'tipo_apparecchio', 'marca_apparecchio', 'modello_apparecchio', 'numero_apparecchi',
         'tipo_lampada', 'potenza_lampada', 'tipo_sostegno', 'tipo_linea', 'promiscuita', 'note', 'garanzia',
         'lat', 'lng', 'pod', 'numero_contatore', 'alimentazione', 'potenza_contratto', 'potenza', 'punti_luce', 'tipo',
         'altezza_sostegno', 'data_creazione',
@@ -539,9 +567,6 @@ function normalizeLightPointData(lp) {
     }
 
     // Migrazione alias CSV legacy → schema aggiornato
-    if (!normalized.armatura && lowerCaseLp.modello_armatura) {
-        normalized.armatura = lowerCaseLp.modello_armatura;
-    }
     if (!normalized.modello_apparecchio && lowerCaseLp.modello) {
         normalized.modello_apparecchio = lowerCaseLp.modello;
     }
@@ -1054,8 +1079,13 @@ router.get('/lightpoints/getActiveReports', async (req, res) => {
                 match: { numero_palo },
                 populate: {
                     path: 'segnalazioni_in_corso',
-                    model: 'reports'
-                }
+                    model: 'reports',
+                    populate: {
+                        path: 'linked_quote_id',
+                        model: 'quotes',
+                        select: 'protocolNumber status type total dueDate',
+                    },
+                },
             });
 
         if (townHall && townHall.punti_luce.length > 0) {

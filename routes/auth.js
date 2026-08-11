@@ -2,10 +2,10 @@ const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const users = require('../schemas/users');
-const { transporter, emailLighting, debugMail } = require('../config/email');
-const { returnHtmlEmailAdmin } = require('../utils/emailHelpers');
+const { debugMail } = require('../config/email');
 const accessLogger = require('../middleware/accessLogger');
 const logAccess = require('../utils/accessLogger');
+const { signAccessToken } = require('../utils/jwtHelpers');
 const router = express.Router();
 const borders = require("./../schemas/borders");
 
@@ -100,17 +100,8 @@ router.post('/login', async function (req, res) {
         const user = await users.findOne({email: {$eq: req.body.email}}).populate('town_halls_list');
         const validation = await validateUserForLogin(user, req.body.password);
         if (validation.error) return res.status(400).send(validation.error);
-        // Create JWT token with user data
-        const token = jwt.sign(
-            { 
-                id: user._id,
-                email: user.email,
-                name: user.name,
-                surname: user.surname
-            }, 
-            process.env.JWT_SECRET,
-            { expiresIn: process.env.JWT_EXPIRES_IN }
-        );
+        const rememberMe = Boolean(req.body.rememberMe);
+        const token = signAccessToken(user, rememberMe);
         await logAccess({
             user: user._id, 
             action: 'LOGIN',
@@ -128,6 +119,7 @@ router.post('/login', async function (req, res) {
                 email: user.email,
                 is_approved: user.is_approved,
                 user_type: user.user_type,
+                sub_role: user.sub_role || null,
                 town_halls_list: user.town_halls_list,
                 id_organization: user.id_organization
             },
@@ -194,16 +186,22 @@ router.post('/addPendingUser', async function (req, res) {
     }
 });
 
-router.get("/test-mail", async (req, res) => {
-    const { sendConfirmationEmail } = require('../utils/emailHelpers');
+if (process.env.NODE_ENV !== 'production') {
+    router.get('/test-mail', async (req, res) => {
+        const { sendConfirmationEmail } = require('../utils/emailHelpers');
         try {
-            await sendConfirmationEmail({name: "luca", _id:"sdgjhsdguhsdfghsdfjkoghsdjkghsdfjkghsdjkfgsdjk", email: "lighting.map2023@gmail.com"});
+            await sendConfirmationEmail({
+                name: 'test',
+                _id: 'test-mail-dev-only',
+                email: process.env.ADMIN_EMAIL || 'test@example.com',
+            });
         } catch (e) {
             console.log(e);
-            // Non bloccare la registrazione se la mail fallisce
+            return res.status(500).send('Errore invio email di test');
         }
         res.status(200).send('Test email inviata con successo');
-})
+    });
+}
 
 // Conferma email tramite token
 router.get('/confirm-email', async (req, res) => {
@@ -224,23 +222,18 @@ router.get('/confirm-email', async (req, res) => {
 
 router.post('/send-email-to-user/userNeedValidation', async(req, res) => {
     const username = req.body.user.name
-    const htmlEmail = returnHtmlEmailAdmin(username, req.body.user.surname, req.body.user.date)
-    var mailOptions = {
-        from: `LIGHTING MAP<${emailLighting}>` ,
-        to: process.env.ADMIN_EMAIL,
-        subject: `Richiesta di autenticazione per ${username} ${req.body.user.surname}`,
-        html: htmlEmail,
-        attachments: [
-            {
-                filename: 'image-1.png',
-                path: './email/toAdmin/images/image-1.png',
-                cid: 'image1' 
-            }
-        ]
-    };
     try {
-        let info = await transporter.sendMail(mailOptions);
-        debugMail('Email sent: ' + info.response);
+        const { sendConfiguredEmail } = require('../utils/mailEngine');
+        await sendConfiguredEmail('USER_NEED_VALIDATION', {
+            vars: {
+                nome: username || '',
+                cognome: req.body.user.surname || '',
+                email: req.body.user.email || '',
+                data: req.body.user.date
+                    ? new Date(req.body.user.date).toLocaleDateString('it-IT')
+                    : new Date().toLocaleDateString('it-IT'),
+            },
+        });
         const { createNotificationsForEmails, safeNotify } = require('../utils/notificationHelpers');
         await safeNotify(() =>
             createNotificationsForEmails(process.env.ADMIN_EMAIL, {

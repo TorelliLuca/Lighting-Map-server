@@ -9,6 +9,11 @@ const schema = new Schema({
     password: {type: String, required: true},
     date: {type: Date, default: Date.now()},
     user_type: {type: String, enum: ['DEFAULT_USER', 'MAINTAINER', 'ADMINISTRATOR', 'SUPER_ADMIN', 'SURVEYOR'], default: 'DEFAULT_USER'},
+    sub_role: {
+        type: String,
+        enum: [null, 'RUP', 'DEC', 'LEAD_MAINTAINER', 'MAINTAINER'],
+        default: null,
+    },
     town_halls_list: [{type: Schema.Types.ObjectId, ref: 'townHalls'}],
     is_approved: {type: Boolean, default: false},
     emailVerified: {type: Boolean, default: false},

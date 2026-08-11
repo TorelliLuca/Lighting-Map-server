@@ -9,7 +9,6 @@ const schema = new Schema({
     quadro: {type: String, default: ""},
     proprieta: {type: String, default: ""},
     tipo_apparecchio: {type: String, default: ""},
-    armatura: {type: String, default: ""},
     marca_apparecchio: {type: String, default: ""},
     modello_apparecchio: {type: String, default: ""},
     numero_apparecchi: {type: String, default: ""},

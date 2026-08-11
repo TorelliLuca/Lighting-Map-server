@@ -7,12 +7,22 @@ const { parse } = require('json2csv');
 const accessLogger = require('../middleware/accessLogger');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
-const { transporter, emailLighting, debugMail } = require('../config/email');
-const { returnHtmlEmail } = require('../utils/emailHelpers');
+
+function normalizeSubRole(userType, subRoleRaw) {
+    const subRole = subRoleRaw || null;
+    if (userType === 'ADMINISTRATOR') {
+        return ['RUP', 'DEC'].includes(subRole) ? subRole : null;
+    }
+    if (userType === 'MAINTAINER') {
+        return ['LEAD_MAINTAINER', 'MAINTAINER'].includes(subRole) ? subRole : null;
+    }
+    return null;
+}
 
 // User validation
 router.post('/validateUser', async (req, res) => {
     const usrType = req.body.user_type
+    const subRole = req.body.sub_role
     const id = req.body.userId
 
     if (!id) return res.status(404).send('ID non valido');
@@ -22,6 +32,7 @@ router.post('/validateUser', async (req, res) => {
         
         usr.is_approved = true;
         usr.user_type = usrType || usr.user_type;
+        usr.sub_role = normalizeSubRole(usr.user_type, subRole);
 
         // If a townhall id was provided, find it and link it
         const townHallId = req.body.townHallId
@@ -36,26 +47,14 @@ router.post('/validateUser', async (req, res) => {
         await usr.save();
 
         try {
-            const {returnHtmlUserValidated} = require('../utils/emailHelpers');
-            const htmlEmail = returnHtmlUserValidated(usr, usrType);
-
-            await transporter.sendMail({
-                from: `LIGHTING MAP - Account validato <${emailLighting}>`,
-                to: usr.email,
-                subject: 'Il tuo account è stato validato',
-                html: htmlEmail,
-                attachments: [
-                    {
-                        filename: 'image-1.png',
-                        path: './email/userValidated/images/image-1.png',
-                        cid: 'image1' // cid for inline image
-                    },
-                    {
-                        filename: 'image-2.png',
-                        path: './email/userValidated/images/image-2.png',
-                        cid: 'image2' // cid for inline image
-                    }
-                ]
+            const { sendConfiguredEmail } = require('../utils/mailEngine');
+            await sendConfiguredEmail('USER_VALIDATED', {
+                recipientUserIds: [usr._id],
+                vars: {
+                    nome: usr.name || '',
+                    cognome: usr.surname || '',
+                    email: usr.email || '',
+                },
             });
 
             const { createNotification, safeNotify } = require('../utils/notificationHelpers');
@@ -160,6 +159,7 @@ router.post('/update/modifyUser', async (req, res) => {
         usr.name = userData.name;
         usr.surname = userData.surname;
         usr.user_type = userData.user_type; 
+        usr.sub_role = normalizeSubRole(userData.user_type, userData.sub_role);
         usr.email = userData.email;
         
         if (userData.password) {
@@ -345,22 +345,6 @@ router.get('/api/downloadCsv', async function (req, res) {
     }
 });
 
-router.post('/refresh-token', (req, res) => {
-    // Create a new token with the same user info
-    const token = jwt.sign(
-        { 
-            id: req.user.id,
-            email: req.user.email,
-            name: req.user.name,
-            surname: req.user.surname
-        }, 
-        process.env.JWT_SECRET,
-        { expiresIn: process.env.JWT_EXPIRES_IN }
-    );
-    
-    res.json({ token });
-});
-
 // Endpoint per ottenere la somma totale dei punti luce dei comuni associati a un utente
 router.get('/:id/lightPointsCount', async function (req, res) {
     try {
@@ -388,7 +372,7 @@ router.get('/:id/lightPointsCount', async function (req, res) {
 
 
 router.post('/update-user-type', async (req, res) => {
-    const { userId, newUserType } = req.body;
+    const { userId, newUserType, sub_role: subRole } = req.body;
 
     if (!userId || !newUserType) {
         return res.status(400).json({ error: 'Missing userId or newUserType' });
@@ -401,6 +385,7 @@ router.post('/update-user-type', async (req, res) => {
         }
 
         user.user_type = newUserType;
+        user.sub_role = normalizeSubRole(newUserType, subRole);
         user.is_approved = true; 
         await user.save();
         res.json({ message: 'User type updated successfully', user });
