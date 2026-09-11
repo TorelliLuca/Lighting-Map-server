@@ -1,23 +1,22 @@
 const express = require('express');
 const townHalls = require('../schemas/townHalls');
-const operations = require('../schemas/operations');
-const light_points = require('../schemas/lightPoints');
 const users = require('../schemas/users');
-const organizations =  require('../schemas/organizations');
+const organizations = require('../schemas/organizations');
+const MaintenanceConfig = require('../schemas/maintenanceConfig');
 const mongoose = require('mongoose');
-const { getAllPuntiLuce } = require('../utils/lightPointHelpers');
-const accessLogger = require('../middleware/accessLogger');
-const logAccess = require('../utils/accessLogger');
-const reports = require('../schemas/reports');
-const router = express.Router();    
-const { ObjectId } = require('mongodb');
+const {
+    findActiveConfig,
+    getOrCreateActiveConfig,
+    buildValidityMeta,
+    enrichConfigDocument,
+} = require('../utils/maintenanceConfigHelpers');
+const router = express.Router();
 
-
-router.get("/my-organization/:organizationId", async (req, res) => {
+router.get('/my-organization/:organizationId', async (req, res) => {
     try {
         const organizationId = req.params.organizationId;
         const organization = await organizations.findById(organizationId).populate('members').populate('responsible');
-        if (!organization) return res.status(404).send( 'Organizzazione non trovata');
+        if (!organization) return res.status(404).send('Organizzazione non trovata');
         res.status(200).json(organization);
     } catch (err) {
         console.error(err);
@@ -25,7 +24,7 @@ router.get("/my-organization/:organizationId", async (req, res) => {
     }
 });
 
-router.get("/all-organizations", async (req, res) => {
+router.get('/all-organizations', async (req, res) => {
     try {
         const organizationsList = await organizations.find();
         res.status(200).json(organizationsList);
@@ -35,122 +34,160 @@ router.get("/all-organizations", async (req, res) => {
     }
 });
 
-router.get("/townhall/:townhallId", async (req, res) => {
+/**
+ * Organizzazioni manutentori del comune, legate al capitolato attivo
+ * (con budget ordinaria/straordinaria). Fallback legacy su contracts[].
+ */
+router.get('/townhall/:townhallId', async (req, res) => {
     try {
-        const townhallId = req.params.townhallId;
+        const townhallParam = req.params.townhallId;
+        let townHallOid = null;
 
-        if (!mongoose.Types.ObjectId.isValid(townhallId)) {
-            return res.status(400).json({ error: 'L\'ID del comune fornito non è valido.' });
+        if (mongoose.Types.ObjectId.isValid(townhallParam)) {
+            townHallOid = new mongoose.Types.ObjectId(townhallParam);
+        } else {
+            const decoded = decodeURIComponent(townhallParam);
+            const byName = await townHalls.findOne({ name: decoded }).select('_id').lean();
+            if (byName?._id) townHallOid = byName._id;
         }
 
-        const pipeline = [
-            // Stage 1: Filtra le organizzazioni che hanno contratti con l'ID del comune
-            {
-                $match: {
-                    "contracts.townhall_associated": new mongoose.Types.ObjectId(townhallId)
-                }
-            },
-            // Stage 2: Srotola l'array dei contratti per lavorarci su un elemento alla volta
-            {
-                $unwind: "$contracts"
-            },
-            // Stage 3: Filtra per mantenere solo i contratti specifici
-            {
-                $match: {
-                    "contracts.townhall_associated": new mongoose.Types.ObjectId(townhallId)
-                }
-            },
-            // Stage 4: "Popula" il campo townhall_associated
-            // Stage 6: Popula altri campi, come 'responsible' e 'members'
-            {
-                $lookup: {
-                    from: "users",
-                    localField: "responsible",
-                    foreignField: "_id",
-                    as: "responsible"
-                }
-            },
-            {
-                $unwind: { path: "$responsible", preserveNullAndEmptyArrays: true }
-            },
-            {
-                $lookup: {
-                    from: "users",
-                    localField: "members",
-                    foreignField: "_id",
-                    as: "members"
-                }
-            },
-            // Stage 7: Raggruppa i documenti per ricostruire l'organizzazione originale
-            {
-                $group: {
-                    _id: "$_id",
-                    name: { $first: "$name" },
-                    description: { $first: "$description" },
-                    created_at: { $first: "$created_at" },
-                    updated_at: { $first: "$updated_at" },
-                    logo: { $first: "$logo" },
-                    type: { $first: "$type" },
-                    location: { $first: "$location" },
-                    address: { $first: "$address" },
-                    responsible: { $first: "$responsible" },
-                    townhallId: { $first: "$townhallId" },
-                    members: {$first: "$members"},
-                    // Ricostruisci l'array dei contratti filtrato e popolato
-                    contracts: { $push: "$contracts" }
-                },
-                
+        if (!townHallOid) {
+            return res.status(400).json({ error: "L'ID o il nome del comune fornito non è valido." });
+        }
 
-            },
-            {
-            $sort: {
-                name: 1 
+        const activeConfig = await findActiveConfig(townHallOid);
+        const validity = activeConfig ? buildValidityMeta(activeConfig) : null;
+        const linked = Array.isArray(activeConfig?.linkedOrganizations)
+            ? activeConfig.linkedOrganizations
+            : [];
+
+        let orgDocs = [];
+        const bindingByOrgId = new Map();
+
+        if (linked.length > 0) {
+            const orgIds = linked.map((item) => item.organizationId).filter(Boolean);
+            orgDocs = await organizations.find({ _id: { $in: orgIds } })
+                .populate('members')
+                .populate('responsible')
+                .lean();
+            for (const item of linked) {
+                bindingByOrgId.set(String(item.organizationId), {
+                    budgetOrdinary: Number(item.budgetOrdinary) || 0,
+                    budgetExtraordinary: Number(item.budgetExtraordinary) || 0,
+                    notes: item.notes || '',
+                });
+            }
+        } else {
+            // Legacy: contratti org↔comune o maintainers sul comune
+            const townHall = await townHalls.findById(townHallOid)
+                .select('organizations_maintainers')
+                .lean();
+            const maintainerIds = (townHall?.organizations_maintainers || []).map(String);
+
+            const byContract = await organizations.find({
+                type: 'ENTERPRISE',
+                'contracts.townhall_associated': townHallOid,
+            })
+                .populate('members')
+                .populate('responsible')
+                .lean();
+
+            const byMaintainer = maintainerIds.length > 0
+                ? await organizations.find({
+                    _id: { $in: maintainerIds },
+                    type: 'ENTERPRISE',
+                })
+                    .populate('members')
+                    .populate('responsible')
+                    .lean()
+                : [];
+
+            const byId = new Map();
+            for (const org of [...byContract, ...byMaintainer]) {
+                byId.set(String(org._id), org);
+            }
+            orgDocs = [...byId.values()];
+
+            for (const org of orgDocs) {
+                const contract = (org.contracts || []).find(
+                    (c) => String(c.townhall_associated) === String(townHallOid)
+                );
+                bindingByOrgId.set(String(org._id), {
+                    budgetOrdinary: Number(contract?.price) || 0,
+                    budgetExtraordinary: 0,
+                    notes: contract?.details || '',
+                });
             }
         }
-        ];
-        const options = {
-                collation: {
-                    locale: 'it',
-                    strength: 2
-                }
+
+        orgDocs.sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'it', { sensitivity: 'base' }));
+
+        const payload = orgDocs.map((org) => {
+            const binding = bindingByOrgId.get(String(org._id)) || {
+                budgetOrdinary: 0,
+                budgetExtraordinary: 0,
+                notes: '',
             };
+            const responsible = org.responsible;
+            const responsibleLabel = responsible
+                ? [responsible.name, responsible.surname].filter(Boolean).join(' ').trim()
+                    || responsible.email
+                    || null
+                : null;
 
-        const orgs = await organizations.aggregate(pipeline, options);
+            return {
+                ...org,
+                id: org._id,
+                isActive: true,
+                responsible: responsibleLabel || org.responsible || null,
+                responsibleUser: responsible || null,
+                members: (org.members || []).map((m) => ({
+                    ...m,
+                    id: m._id,
+                })),
+                capitolato: activeConfig
+                    ? {
+                        configId: activeConfig._id,
+                        version: activeConfig.capitolatoVersion,
+                        status: activeConfig.status,
+                        validFrom: activeConfig.validFrom,
+                        validTo: activeConfig.validTo,
+                        validity,
+                    }
+                    : null,
+                budgetOrdinary: binding.budgetOrdinary,
+                budgetExtraordinary: binding.budgetExtraordinary,
+                bindingNotes: binding.notes,
+                // Compatibilità UI legacy: non più fonte di verità
+                contracts: [],
+            };
+        });
 
-        if (orgs.length === 0) {
-            return res.status(404).json({ message: 'Nessuna organizzazione trovata per questo comune.' });
+        if (payload.length === 0) {
+            return res.status(200).json([]);
         }
 
-        res.status(200).json(orgs);
+        res.status(200).json(payload);
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: 'Errore interno del server.' });
     }
 });
 
-
 router.post('/add-organization', async (req, res) => {
     try {
-        const { contract, name, description, type, logo, location, address, townhall_id } = req.body;
-        console.log(location);
+        const { name, description, type, logo, location, address, townhall_id } = req.body;
         const newOrganization = new organizations({
             name,
             description,
             type,
             logo,
             location,
-            address});
-        if (contract) {
-            newOrganization.contracts.push(contract);
-            const townhallToUpdate = await townHalls.findById(contract.associated_townhall_id);
-            if (townhallToUpdate) {
-                townhallToUpdate.organizations_maintainers.push(newOrganization._id);
-                await townhallToUpdate.save();
-            }
-        }
+            address,
+        });
         if (townhall_id) {
             newOrganization.townhallId = townhall_id;
-            townhallToUpdate = await townHalls.findById(townhall_id);
+            const townhallToUpdate = await townHalls.findById(townhall_id);
             if (townhallToUpdate) {
                 townhallToUpdate.organization_admin = newOrganization._id;
                 await townhallToUpdate.save();
@@ -171,7 +208,7 @@ router.put('/add-users-to-organization', async (req, res) => {
         const updatedOrganization = await organizations.findByIdAndUpdate(
             organizationId,
             { $addToSet: { members: { $each: members } } },
-            { new: true } // Restituisce il documento aggiornato
+            { new: true }
         );
 
         if (!updatedOrganization) {
@@ -186,7 +223,7 @@ router.put('/add-users-to-organization', async (req, res) => {
         if (result.modifiedCount === 0) {
             console.warn('Nessun utente aggiornato. ID utente non validi.');
         }
-        
+
         res.status(200).json(updatedOrganization);
     } catch (err) {
         console.error(err);
@@ -201,15 +238,15 @@ router.put('/remove-user-from-organization', async (req, res) => {
         const updatedOrganization = await organizations.findByIdAndUpdate(
             organizationId,
             { $pull: { members: userId } },
-            { new: true } 
+            { new: true }
         );
         if (!updatedOrganization) {
             return res.status(404).send('Organizzazione non trovata');
         }
         const updatedUser = await users.findByIdAndUpdate(
             userId,
-            { $unset: { id_organization: "" } },
-            { new: true } 
+            { $unset: { id_organization: '' } },
+            { new: true }
         );
         if (!updatedUser) {
             return res.status(404).send('Utente non trovato');
@@ -219,35 +256,79 @@ router.put('/remove-user-from-organization', async (req, res) => {
         console.error(err);
         res.status(500).json({ error: 'Errore interno del server' });
     }
-})
+});
 
-router.put("/add-contract-to-organization", async (req, res) => {
-    const { organizationId, contract } = req.body;
-    console.log(req.body);
+/**
+ * @deprecated Preferire ParametriCapitolato → linkedOrganizations.
+ * Compatibilità: collega l'org al capitolato attivo del comune con budget O/S.
+ */
+router.put('/add-contract-to-organization', async (req, res) => {
+    const { organizationId, contract, budgetOrdinary, budgetExtraordinary } = req.body;
     try {
         const organization = await organizations.findById(organizationId);
-        console.log(contract);
         if (!organization) return res.status(404).send('Organizzazione non trovata');
-        organization.contracts.push(contract);
-        await organization.save();
-        const townhallToUpdate = await townHalls.findById(contract.townhall_associated);
-        if (townhallToUpdate) {
+        if (organization.type !== 'ENTERPRISE') {
+            return res.status(400).json({ error: 'Solo organizzazioni ENTERPRISE possono essere collegate al capitolato' });
+        }
+
+        const townhallId = contract?.townhall_associated || contract?.associated_townhall_id;
+        if (!townhallId || !mongoose.Types.ObjectId.isValid(townhallId)) {
+            return res.status(400).json({ error: 'Comune (townhall_associated) obbligatorio' });
+        }
+
+        const townhallToUpdate = await townHalls.findById(townhallId);
+        if (!townhallToUpdate) {
+            return res.status(404).json({ error: 'Comune non trovato' });
+        }
+
+        const config = await getOrCreateActiveConfig(townhallId, null);
+        const existing = (config.linkedOrganizations || []).find(
+            (item) => String(item.organizationId) === String(organizationId)
+        );
+        const ordinary = budgetOrdinary != null
+            ? Number(budgetOrdinary)
+            : (existing ? Number(existing.budgetOrdinary) || 0 : Number(contract?.price) || 0);
+        const extraordinary = budgetExtraordinary != null
+            ? Number(budgetExtraordinary)
+            : (existing ? Number(existing.budgetExtraordinary) || 0 : 0);
+
+        if (!Number.isFinite(ordinary) || ordinary < 0 || !Number.isFinite(extraordinary) || extraordinary < 0) {
+            return res.status(400).json({ error: 'I budget devono essere numeri >= 0' });
+        }
+
+        if (existing) {
+            existing.budgetOrdinary = ordinary;
+            existing.budgetExtraordinary = extraordinary;
+            if (contract?.details) existing.notes = String(contract.details);
+        } else {
+            config.linkedOrganizations.push({
+                organizationId: organization._id,
+                budgetOrdinary: ordinary,
+                budgetExtraordinary: extraordinary,
+                notes: contract?.details ? String(contract.details) : '',
+            });
+        }
+        await config.save();
+
+        if (!townhallToUpdate.organizations_maintainers.some((id) => String(id) === String(organization._id))) {
             townhallToUpdate.organizations_maintainers.push(organization._id);
-            console.log("organization._id: ", organization._id);
-            console.log("organizationId: ", organizationId);
             await townhallToUpdate.save();
         }
-        res.status(200).json(organization);
+
+        const enriched = await enrichConfigDocument(config);
+        res.status(200).json({
+            organization,
+            capitolato: enriched,
+            message: 'Organizzazione collegata al capitolato attivo del comune',
+        });
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: 'Errore interno del server' });
     }
 });
 
-router.put("/associate-townhall-to-organization", async (req, res) => {
+router.put('/associate-townhall-to-organization', async (req, res) => {
     const { organizationId, townhallId } = req.body;
-    console.log(organizationId, townhallId);
-    //sessione inizio
     const session = await mongoose.startSession();
     session.startTransaction();
     try {
@@ -255,14 +336,15 @@ router.put("/associate-townhall-to-organization", async (req, res) => {
         if (!organization) {
             await session.abortTransaction();
             session.endSession();
-            return res.status(404).send('Organizzazione non trovata');}
+            return res.status(404).send('Organizzazione non trovata');
+        }
         organization.townhallId = townhallId;
         await organization.save();
         const townhallToUpdate = await townHalls.findById(townhallId);
         if (townhallToUpdate) {
             townhallToUpdate.organization_admin = organization._id;
             await townhallToUpdate.save();
-        }else{
+        } else {
             await session.abortTransaction();
             session.endSession();
             return res.status(404).send('Municipio non trovato');
@@ -270,7 +352,6 @@ router.put("/associate-townhall-to-organization", async (req, res) => {
         session.commitTransaction();
         session.endSession();
         res.status(200).json(organization);
-        
     } catch (err) {
         console.error(err);
         await session.abortTransaction();
@@ -330,7 +411,7 @@ function validateOrganizationPatch(body) {
         if (body.address === null) {
             updates.address = {};
         } else if (typeof body.address !== 'object' || Array.isArray(body.address)) {
-            errors.push('L\'indirizzo deve essere un oggetto.');
+            errors.push("L'indirizzo deve essere un oggetto.");
         } else {
             const addressUnknown = Object.keys(body.address).filter((key) => !ADDRESS_FIELDS.includes(key));
             if (addressUnknown.length > 0) {
@@ -445,13 +526,13 @@ router.patch('/:id', async (req, res) => {
                 }
 
                 const alreadyTaken =
-                    townhallToUpdate.organization_admin &&
-                    townhallToUpdate.organization_admin.toString() !== organizationId;
+                    townhallToUpdate.organization_admin
+                    && townhallToUpdate.organization_admin.toString() !== organizationId;
                 if (alreadyTaken) {
                     await session.abortTransaction();
                     session.endSession();
                     return res.status(409).json({
-                        error: 'Il comune è già associato a un\'altra organizzazione.',
+                        error: "Il comune è già associato a un'altra organizzazione.",
                     });
                 }
 
@@ -459,13 +540,13 @@ router.patch('/:id', async (req, res) => {
                 await townhallToUpdate.save({ session });
             } else {
                 delete updates.townhallId;
-                unsetFields.townhallId = "";
+                unsetFields.townhallId = '';
             }
 
             if (previousTownhallId && previousTownhallId !== newTownhallId) {
                 await townHalls.updateOne(
                     { _id: previousTownhallId, organization_admin: organizationId },
-                    { $unset: { organization_admin: "" } },
+                    { $unset: { organization_admin: '' } },
                     { session }
                 );
             }
@@ -502,28 +583,34 @@ router.patch('/:id', async (req, res) => {
     }
 });
 
+async function purgeOrganizationFromCapitolati(organizationId, session) {
+    await MaintenanceConfig.updateMany(
+        { 'linkedOrganizations.organizationId': organizationId },
+        { $pull: { linkedOrganizations: { organizationId } } },
+        session ? { session } : undefined
+    );
+}
+
 router.delete('/:id', async (req, res) => {
-    // Inizia una sessione di transazione per garantire l'atomicità
     const session = await mongoose.startSession();
     session.startTransaction();
 
     try {
         const organizationId = req.params.id;
 
-        // 1. Pulisci il riferimento negli utenti
         await users.updateMany({ id_organization: organizationId }, { $set: { id_organization: null } }, { session });
 
-        // 2. Pulisci il riferimento nei comuni
         await townHalls.updateMany(
             { $or: [{ organization_admin: organizationId }, { organizations_maintainers: organizationId }] },
-            { 
-                $unset: { organization_admin: "" }, // Rimuove il campo se è presente
-                $pull: { organizations_maintainers: organizationId } // Rimuove l'ID dall'array
+            {
+                $unset: { organization_admin: '' },
+                $pull: { organizations_maintainers: organizationId },
             },
             { session }
         );
 
-        // 3. Trova e rimuovi l'organizzazione
+        await purgeOrganizationFromCapitolati(organizationId, session);
+
         const deletedOrganization = await organizations.findByIdAndDelete(organizationId, { session });
         if (!deletedOrganization) {
             await session.abortTransaction();
@@ -531,12 +618,10 @@ router.delete('/:id', async (req, res) => {
             return res.status(404).json({ message: 'Organizzazione non trovata.' });
         }
 
-        // Commit della transazione se tutto è andato a buon fine
         await session.commitTransaction();
         session.endSession();
 
         res.status(200).json({ message: 'Organizzazione e riferimenti correlati puliti con successo.' });
-
     } catch (error) {
         await session.abortTransaction();
         session.endSession();
@@ -551,27 +636,26 @@ router.delete('/:id/with-users', async (req, res) => {
 
     try {
         const organizationId = req.params.id;
-        
-        // 1. Trova e elimina l'organizzazione
+
         const deletedOrganization = await organizations.findByIdAndDelete(organizationId, { session });
         if (!deletedOrganization) {
             await session.abortTransaction();
             session.endSession();
             return res.status(404).json({ message: 'Organizzazione non trovata.' });
         }
-        
-        // 2. Elimina tutti gli utenti associati
+
         const result = await users.deleteMany({ id_organization: organizationId }, { session });
 
-        // 3. Pulisci il riferimento nei comuni
         await townHalls.updateMany(
             { $or: [{ organization_admin: organizationId }, { organizations_maintainers: organizationId }] },
-            { 
-                $unset: { organization_admin: "" },
-                $pull: { organizations_maintainers: organizationId }
+            {
+                $unset: { organization_admin: '' },
+                $pull: { organizations_maintainers: organizationId },
             },
             { session }
         );
+
+        await purgeOrganizationFromCapitolati(organizationId, session);
 
         await session.commitTransaction();
         session.endSession();
@@ -579,7 +663,6 @@ router.delete('/:id/with-users', async (req, res) => {
         res.status(200).json({
             message: `Organizzazione e ${result.deletedCount} utenti e relativi riferimenti nei comuni eliminati con successo.`,
         });
-
     } catch (error) {
         await session.abortTransaction();
         session.endSession();

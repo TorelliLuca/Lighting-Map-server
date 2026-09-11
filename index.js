@@ -35,6 +35,7 @@ const organizationsRoutes = require('./routes/organizations');
 const bordersRoutes = require('./routes/borders');
 const notificationsRoutes = require('./routes/notifications');
 const maintenanceConfigRoutes = require('./routes/maintenanceConfig');
+const regionalPriceListRoutes = require('./routes/regionalPriceLists');
 const inspectionsRoutes = require('./routes/inspections');
 const quotesRoutes = require('./routes/quotes');
 
@@ -150,6 +151,7 @@ app.use('/borders', bordersRoutes);
 
 // Maintenance capitolato / catalogo materiali per comune
 app.use('/api/maintenance-config', maintenanceConfigRoutes);
+app.use('/api/regional-price-lists', regionalPriceListRoutes);
 
 // Sopralluoghi manutenzione ordinaria
 app.use('/api/inspections', inspectionsRoutes);

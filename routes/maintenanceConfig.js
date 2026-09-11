@@ -2,9 +2,6 @@ const express = require('express');
 const mongoose = require('mongoose');
 const MaintenanceConfig = require('../schemas/maintenanceConfig');
 const townHalls = require('../schemas/townHalls');
-const { cloneDefaults } = require('../utils/maintenanceConfigDefaults');
-const { importMaterialCatalogFromBra } = require('../utils/braCatalogImport');
-const { parsePrezziarioCsv } = require('../utils/prezziarioCsvImport');
 const {
     ensureLegacyMigration,
     buildValidityMeta,
@@ -14,7 +11,21 @@ const {
     copySequences,
     assertEditable,
     validateValidityRange,
+    mergeCatalogByPriceType,
+    mergeMaterialCategories,
+    stripRegionalFromCatalog,
+    enrichConfigDocument,
+    normalizeLinkedOrganizations,
+    nextNpCode,
+    parseNpSequence,
+    normalizeNpCode,
+    normalizeBomList,
+    sumBomUnitPrice,
 } = require('../utils/maintenanceConfigHelpers');
+const { cloneDefaults, DEFAULT_MATERIAL_CATEGORIES } = require('../utils/maintenanceConfigDefaults');
+const { importMaterialCatalogFromBra } = require('../utils/braCatalogImport');
+const { parsePrezziarioCsv } = require('../utils/prezziarioCsvImport');
+const { normalizeUdm } = require('../utils/udm');
 const {
     STAFF_ROLES,
     CONFIG_EDITOR_ROLES,
@@ -22,6 +33,7 @@ const {
     requireTownHallAccess,
     requireTownHallEdit,
 } = require('../utils/roles');
+const Organizations = require('../schemas/organizations');
 
 const router = express.Router();
 
@@ -33,6 +45,9 @@ const EDITABLE_FIELDS = [
     'riskClasses',
     'faultLabels',
     'materialCatalog',
+    'materialCategories',
+    'regionalPriceListId',
+    'linkedOrganizations',
     'standardTemplateId',
 ];
 
@@ -44,20 +59,57 @@ async function resolveTownHallId(townHallIdOrName) {
     return townHalls.findOne({ name: { $eq: townHallIdOrName } }).select('_id name');
 }
 
+/**
+ * Allinea townHall.organizations_maintainers agli org collegati al capitolato.
+ */
+async function syncTownHallMaintainers(townHallId, linkedOrganizations) {
+    const orgIds = (linkedOrganizations || [])
+        .map((item) => item.organizationId)
+        .filter(Boolean);
+    await townHalls.findByIdAndUpdate(townHallId, {
+        $set: { organizations_maintainers: orgIds },
+    });
+}
+
 function applyEditableFields(target, body, userId) {
     for (const field of EDITABLE_FIELDS) {
-        if (body[field] !== undefined) {
-            target[field] = body[field];
+        if (body[field] === undefined) continue;
+        if (field === 'materialCatalog') {
+            target.materialCatalog = stripRegionalFromCatalog(body.materialCatalog);
+            continue;
         }
+        if (field === 'regionalPriceListId') {
+            target.regionalPriceListId = body.regionalPriceListId || null;
+            continue;
+        }
+        if (field === 'linkedOrganizations') {
+            const normalized = normalizeLinkedOrganizations(body.linkedOrganizations);
+            if (!normalized.ok) {
+                const error = new Error(normalized.error);
+                error.status = 400;
+                throw error;
+            }
+            target.linkedOrganizations = normalized.value;
+            continue;
+        }
+        target[field] = body[field];
     }
     target.updatedBy = userId;
 }
 
-function activeResponse(townHall, config) {
+async function activeResponse(townHall, config) {
     return {
         townHall,
-        config,
+        config: await enrichConfigDocument(config),
         validity: buildValidityMeta(config),
+    };
+}
+
+async function configResponse(townHall, config, extra = {}) {
+    return {
+        townHall,
+        config: await enrichConfigDocument(config),
+        ...extra,
     };
 }
 
@@ -77,7 +129,7 @@ router.get('/by-name/:townHallName', requireRole(...STAFF_ROLES), async (req, re
         if (!(await requireTownHallAccess(req, res, townHall._id))) return;
 
         const config = await getOrCreateActiveConfig(townHall._id, req.currentUser._id);
-        return res.json(activeResponse(townHall, config));
+        return res.json(await activeResponse(townHall, config));
     } catch (error) {
         console.error('Errore GET maintenance-config by-name:', error);
         return res.status(500).json({ error: 'Errore del server' });
@@ -100,8 +152,7 @@ router.get('/config/:configId', requireRole(...CONFIG_EDITOR_ROLES), async (req,
 
         const townHall = await townHalls.findById(config.townHallId).select('_id name');
         return res.json({
-            townHall,
-            config,
+            ...(await configResponse(townHall, config)),
             validity: buildValidityMeta(config),
         });
     } catch (error) {
@@ -123,19 +174,47 @@ router.put('/config/:configId', requireRole(...CONFIG_EDITOR_ROLES), async (req,
         }
         if (!(await requireTownHallEdit(req, res, config.townHallId))) return;
 
-        applyEditableFields(config, req.body || {}, req.currentUser._id);
+        const prevLinked = JSON.stringify(config.linkedOrganizations || []);
+        try {
+            applyEditableFields(config, req.body || {}, req.currentUser._id);
+        } catch (fieldError) {
+            if (fieldError.status === 400) {
+                return res.status(400).json({ error: fieldError.message });
+            }
+            throw fieldError;
+        }
+
+        if (req.body?.linkedOrganizations !== undefined) {
+            const orgIds = (config.linkedOrganizations || []).map((item) => item.organizationId);
+            if (orgIds.length > 0) {
+                const count = await Organizations.countDocuments({
+                    _id: { $in: orgIds },
+                    type: 'ENTERPRISE',
+                });
+                if (count !== orgIds.length) {
+                    return res.status(400).json({
+                        error: 'Tutte le organizzazioni collegate devono esistere ed essere di tipo ENTERPRISE',
+                    });
+                }
+            }
+        }
+
         const rangeCheck = validateValidityRange(config.validFrom, config.validTo);
         if (!rangeCheck.ok) {
             return res.status(400).json({ error: rangeCheck.error });
         }
         await config.save();
 
+        if (
+            req.body?.linkedOrganizations !== undefined
+            && config.status === 'active'
+            && prevLinked !== JSON.stringify(config.linkedOrganizations || [])
+        ) {
+            await syncTownHallMaintainers(config.townHallId, config.linkedOrganizations);
+        }
+
         const townHall = await townHalls.findById(config.townHallId).select('_id name');
-        return res.json({
-            townHall,
-            config,
-            validity: buildValidityMeta(config),
-        });
+        return res.json({ ...(await configResponse(townHall, config)), validity: buildValidityMeta(config) });
     } catch (error) {
         console.error('Errore PUT config by id:', error);
         return res.status(500).json({ error: 'Errore del server' });
@@ -172,11 +251,7 @@ router.patch('/config/:configId/extend', requireRole(...CONFIG_EDITOR_ROLES), as
         await config.save();
 
         const townHall = await townHalls.findById(config.townHallId).select('_id name');
-        return res.json({
-            townHall,
-            config,
-            validity: buildValidityMeta(config),
-        });
+        return res.json({ ...(await configResponse(townHall, config)), validity: buildValidityMeta(config) });
     } catch (error) {
         console.error('Errore PATCH extend:', error);
         return res.status(500).json({ error: 'Errore del server' });
@@ -215,13 +290,10 @@ router.post('/config/:configId/activate', requireRole(...CONFIG_EDITOR_ROLES), a
         draft.markModified('sequences');
         await draft.save();
 
+        await syncTownHallMaintainers(draft.townHallId, draft.linkedOrganizations);
+
         const townHall = await townHalls.findById(draft.townHallId).select('_id name');
-        return res.json({
-            townHall,
-            config: draft,
-            archivedConfigId: currentActive?._id || null,
-            validity: buildValidityMeta(draft),
-        });
+        return res.json({ ...(await configResponse(townHall, draft)), archivedConfigId: currentActive?._id || null, validity: buildValidityMeta(draft) });
     } catch (error) {
         console.error('Errore POST activate:', error);
         if (error?.code === 11000) {
@@ -244,7 +316,7 @@ router.post('/config/:configId/materials', requireRole(...CONFIG_EDITOR_ROLES), 
         }
         if (!(await requireTownHallEdit(req, res, config.townHallId))) return;
 
-        const { code, description, udm, unitPrice, category, isStandard } = req.body || {};
+        const { code, description, fullDescription, udm, unitPrice, category, isStandard, priceType, addedBy } = req.body || {};
         if (!code || !description || unitPrice == null) {
             return res.status(400).json({ error: 'code, description e unitPrice sono obbligatori' });
         }
@@ -254,19 +326,26 @@ router.post('/config/:configId/materials', requireRole(...CONFIG_EDITOR_ROLES), 
             return res.status(409).json({ error: 'Materiale già presente con questo codice tariffa' });
         }
 
+        const resolvedPriceType = ['regional', 'user', 'capitolato'].includes(priceType)
+            ? priceType
+            : 'capitolato';
+
         config.materialCatalog.push({
             code,
             description,
-            udm: udm || 'cad',
+            fullDescription: fullDescription != null ? String(fullDescription) : '',
+            udm: normalizeUdm(udm),
             unitPrice: Number(unitPrice),
             category: category || '',
             isStandard: isStandard !== false,
+            priceType: resolvedPriceType,
+            addedBy: resolvedPriceType === 'user' ? (addedBy || '') : '',
         });
         config.updatedBy = req.currentUser._id;
         await config.save();
 
         const townHall = await townHalls.findById(config.townHallId).select('_id name');
-        return res.status(201).json({ townHall, config });
+        return res.status(201).json(await configResponse(townHall, config));
     } catch (error) {
         console.error('Errore POST material by configId:', error);
         return res.status(500).json({ error: 'Errore del server' });
@@ -291,19 +370,30 @@ router.patch('/config/:configId/materials/:code', requireRole(...CONFIG_EDITOR_R
             return res.status(404).json({ error: 'Materiale non trovato' });
         }
 
-        const { description, udm, unitPrice, category, isStandard } = req.body || {};
+        const { description, fullDescription, udm, unitPrice, category, isStandard, priceType, addedBy } = req.body || {};
         if (description !== undefined) item.description = description;
-        if (udm !== undefined) item.udm = udm;
+        if (fullDescription !== undefined) item.fullDescription = String(fullDescription || '');
+        if (udm !== undefined) item.udm = normalizeUdm(udm);
         if (unitPrice !== undefined) item.unitPrice = Number(unitPrice);
         if (category !== undefined) item.category = category;
         if (isStandard !== undefined) item.isStandard = isStandard;
+        if (priceType !== undefined) {
+            if (!['regional', 'user', 'capitolato'].includes(priceType)) {
+                return res.status(400).json({ error: 'priceType non valido' });
+            }
+            item.priceType = priceType;
+            if (priceType !== 'user') item.addedBy = '';
+        }
+        if (addedBy !== undefined && (item.priceType === 'user' || priceType === 'user')) {
+            item.addedBy = addedBy || '';
+        }
 
         config.updatedBy = req.currentUser._id;
         config.markModified('materialCatalog');
         await config.save();
 
         const townHall = await townHalls.findById(config.townHallId).select('_id name');
-        return res.json({ townHall, config });
+        return res.json(await configResponse(townHall, config));
     } catch (error) {
         console.error('Errore PATCH material by configId:', error);
         return res.status(500).json({ error: 'Errore del server' });
@@ -334,7 +424,7 @@ router.delete('/config/:configId/materials/:code', requireRole(...CONFIG_EDITOR_
         await config.save();
 
         const townHall = await townHalls.findById(config.townHallId).select('_id name');
-        return res.json({ townHall, config });
+        return res.json(await configResponse(townHall, config));
     } catch (error) {
         console.error('Errore DELETE material by configId:', error);
         return res.status(500).json({ error: 'Errore del server' });
@@ -361,24 +451,62 @@ router.post('/config/:configId/import-csv', requireRole(...CONFIG_EDITOR_ROLES),
 
         const { materials, skippedRows } = parsePrezziarioCsv(csv);
 
-        if (merge === true) {
-            const byCode = new Map(config.materialCatalog.map((m) => [m.code, m]));
-            for (const material of materials) {
-                byCode.set(material.code, material);
+        // Legacy: se il comune ha un prezziario regionale collegato, importa lì.
+        if (config.regionalPriceListId) {
+            const RegionalPriceList = require('../schemas/regionalPriceList');
+            const list = await RegionalPriceList.findById(config.regionalPriceListId);
+            if (!list) {
+                return res.status(404).json({ error: 'Prezziario regionale collegato non trovato' });
             }
-            config.materialCatalog = [...byCode.values()];
+            const imported = materials.map((item) => ({
+                code: item.code,
+                description: item.description,
+                fullDescription: item.fullDescription || '',
+                udm: normalizeUdm(item.udm),
+                unitPrice: item.unitPrice,
+                category: item.category || '',
+            }));
+            if (merge === true) {
+                const byCode = new Map((list.materials || []).map((m) => [m.code, {
+                    code: m.code,
+                    description: m.description,
+                    fullDescription: m.fullDescription || '',
+                    udm: normalizeUdm(m.udm),
+                    unitPrice: m.unitPrice,
+                    category: m.category,
+                }]));
+                for (const material of imported) byCode.set(material.code, material);
+                list.materials = [...byCode.values()];
+            } else {
+                list.materials = imported;
+            }
+            list.categories = mergeMaterialCategories(list.categories, list.materials, DEFAULT_MATERIAL_CATEGORIES);
+            list.updatedBy = req.currentUser._id;
+            list.markModified('materials');
+            list.markModified('categories');
+            await list.save();
         } else {
-            config.materialCatalog = materials;
+            config.materialCatalog = mergeCatalogByPriceType(
+                config.materialCatalog,
+                materials,
+                'regional',
+                merge === true
+            );
+            config.materialCategories = mergeMaterialCategories(
+                config.materialCategories,
+                materials,
+                DEFAULT_MATERIAL_CATEGORIES
+            );
+            config.updatedBy = req.currentUser._id;
+            config.markModified('materialCatalog');
+            config.markModified('materialCategories');
+            await config.save();
         }
 
-        config.updatedBy = req.currentUser._id;
-        config.markModified('materialCatalog');
-        await config.save();
-
         const townHall = await townHalls.findById(config.townHallId).select('_id name');
+        const fresh = await MaintenanceConfig.findById(config._id);
         return res.json({
-            townHall,
-            config,
+            ...(await configResponse(townHall, fresh)),
             importedCount: materials.length,
             skippedRows,
         });
@@ -403,26 +531,26 @@ router.post('/config/:configId/import-bra', requireRole(...CONFIG_EDITOR_ROLES),
 
         const materials = importMaterialCatalogFromBra();
         const merge = req.body?.merge === true;
-        if (!merge) {
-            config.materialCatalog = materials;
-        } else {
-            const byCode = new Map(config.materialCatalog.map((m) => [m.code, m]));
-            for (const material of materials) {
-                byCode.set(material.code, material);
-            }
-            config.materialCatalog = [...byCode.values()];
-        }
+
+        config.materialCatalog = mergeCatalogByPriceType(
+            config.materialCatalog,
+            materials,
+            'capitolato',
+            merge
+        );
+        config.materialCategories = mergeMaterialCategories(
+            config.materialCategories,
+            materials,
+            DEFAULT_MATERIAL_CATEGORIES
+        );
 
         config.updatedBy = req.currentUser._id;
         config.markModified('materialCatalog');
+        config.markModified('materialCategories');
         await config.save();
 
         const townHall = await townHalls.findById(config.townHallId).select('_id name');
-        return res.json({
-            townHall,
-            config,
-            importedCount: materials.length,
-        });
+        return res.json({ ...(await configResponse(townHall, config)), importedCount: materials.length });
     } catch (error) {
         console.error('Errore import-bra by configId:', error);
         return res.status(500).json({ error: error.message || 'Errore del server' });
@@ -447,11 +575,14 @@ router.post('/config/:configId/apply-defaults', requireRole(...CONFIG_EDITOR_ROL
         config.faultLabels = defaults.faultLabels;
         config.capitolatoVersion = defaults.capitolatoVersion;
         config.standardTemplateId = defaults.standardTemplateId;
+        if (defaults.materialCategories) {
+            config.materialCategories = defaults.materialCategories;
+        }
         config.updatedBy = req.currentUser._id;
         await config.save();
 
         const townHall = await townHalls.findById(config.townHallId).select('_id name');
-        return res.json({ townHall, config, validity: buildValidityMeta(config) });
+        return res.json({ ...(await configResponse(townHall, config)), validity: buildValidityMeta(config) });
     } catch (error) {
         console.error('Errore apply-defaults by configId:', error);
         return res.status(500).json({ error: 'Errore del server' });
@@ -540,8 +671,7 @@ router.post('/:townHallId/draft', requireRole(...CONFIG_EDITOR_ROLES), async (re
         });
 
         return res.status(201).json({
-            townHall,
-            config: draft,
+            ...(await configResponse(townHall, draft)),
             validity: buildValidityMeta(draft),
         });
     } catch (error) {
@@ -562,7 +692,7 @@ router.get('/:townHallId', requireRole(...STAFF_ROLES), async (req, res) => {
         if (!(await requireTownHallAccess(req, res, townHall._id))) return;
 
         const config = await getOrCreateActiveConfig(townHall._id, req.currentUser._id);
-        return res.json(activeResponse(townHall, config));
+        return res.json(await activeResponse(townHall, config));
     } catch (error) {
         console.error('Errore GET maintenance-config:', error);
         return res.status(500).json({ error: 'Errore del server' });
@@ -579,14 +709,25 @@ router.put('/:townHallId', requireRole(...CONFIG_EDITOR_ROLES), async (req, res)
         if (!(await requireTownHallEdit(req, res, townHall._id))) return;
 
         const config = await getOrCreateActiveConfig(townHall._id, req.currentUser._id);
-        applyEditableFields(config, req.body || {}, req.currentUser._id);
+        try {
+            applyEditableFields(config, req.body || {}, req.currentUser._id);
+        } catch (fieldError) {
+            if (fieldError.status === 400) {
+                return res.status(400).json({ error: fieldError.message });
+            }
+            throw fieldError;
+        }
         const rangeCheck = validateValidityRange(config.validFrom, config.validTo);
         if (!rangeCheck.ok) {
             return res.status(400).json({ error: rangeCheck.error });
         }
         await config.save();
 
-        return res.json(activeResponse(townHall, config));
+        if (req.body?.linkedOrganizations !== undefined) {
+            await syncTownHallMaintainers(townHall._id, config.linkedOrganizations);
+        }
+
+        return res.json(await activeResponse(townHall, config));
     } catch (error) {
         console.error('Errore PUT maintenance-config:', error);
         return res.status(500).json({ error: 'Errore del server' });
@@ -594,6 +735,112 @@ router.put('/:townHallId', requireRole(...CONFIG_EDITOR_ROLES), async (req, res)
 });
 
 // Legacy material/import routes → operate on active
+/**
+ * Upsert di un Nuovo Prezzo (NP) sul capitolato attivo.
+ * Accessibile anche ai manutentori: numerazione NP-n basata sul prezziario attivo.
+ */
+router.post('/:townHallId/materials/np', requireRole(...STAFF_ROLES), async (req, res) => {
+    try {
+        const townHall = await resolveTownHallId(req.params.townHallId);
+        if (!townHall) {
+            return res.status(404).json({ error: 'Comune non trovato' });
+        }
+        if (!(await requireTownHallAccess(req, res, townHall._id))) return;
+
+        const {
+            code: requestedCode,
+            description,
+            fullDescription,
+            udm,
+            unitPrice,
+            category,
+            bom,
+        } = req.body || {};
+
+        if (!description || String(description).trim() === '') {
+            return res.status(400).json({ error: 'description è obbligatoria' });
+        }
+
+        const normalizedBom = normalizeBomList(bom);
+        const computedUnitPrice = normalizedBom.length > 0
+            ? sumBomUnitPrice(normalizedBom)
+            : (Number(unitPrice) || 0);
+
+        if (normalizedBom.length === 0 && (unitPrice == null || unitPrice === '')) {
+            return res.status(400).json({ error: 'unitPrice è obbligatorio se non è presente una distinta BOM' });
+        }
+
+        const config = await getOrCreateActiveConfig(townHall._id, req.currentUser._id);
+        const enriched = await enrichConfigDocument(config);
+        const catalog = enriched?.materialCatalog || [];
+
+        const addedBy = [req.currentUser.name, req.currentUser.surname]
+            .filter(Boolean)
+            .join(' ')
+            .trim() || req.currentUser.email || '';
+
+        let code = String(requestedCode || '').trim();
+        if (code && parseNpSequence(code) == null) {
+            return res.status(400).json({ error: 'Il codice NP deve essere nel formato NP-n (es. NP-001)' });
+        }
+        if (!code) {
+            code = nextNpCode(catalog);
+        } else {
+            code = normalizeNpCode(code);
+        }
+
+        const existingIndex = config.materialCatalog.findIndex(
+            (item) => normalizeNpCode(item.code) === code || item.code === code
+        );
+        const payload = {
+            code,
+            description: String(description).trim(),
+            fullDescription: fullDescription != null ? String(fullDescription).trim() : '',
+            udm: normalizeUdm(udm),
+            unitPrice: computedUnitPrice,
+            category: category || '',
+            isStandard: false,
+            priceType: 'user',
+            addedBy,
+            bom: normalizedBom,
+        };
+
+        if (existingIndex >= 0) {
+            const existing = config.materialCatalog[existingIndex];
+            const existingType = existing.priceType || 'capitolato';
+            if (existingType !== 'user' && parseNpSequence(existing.code) == null) {
+                return res.status(409).json({ error: 'Codice tariffa già presente nel prezziario' });
+            }
+            config.materialCatalog[existingIndex] = {
+                ...(typeof existing.toObject === 'function' ? existing.toObject() : existing),
+                ...payload,
+                priceType: 'user',
+                isStandard: false,
+                addedBy: addedBy || existing.addedBy || '',
+            };
+        } else {
+            // Evita collisioni se il codice era solo nel prezziario regionale
+            if (catalog.some((item) => item.code === code && (item.priceType || '') === 'regional')) {
+                code = nextNpCode(catalog);
+                payload.code = code;
+            }
+            config.materialCatalog.push(payload);
+        }
+
+        config.updatedBy = req.currentUser._id;
+        config.markModified('materialCatalog');
+        await config.save();
+
+        return res.status(existingIndex >= 0 ? 200 : 201).json({
+            ...(await configResponse(townHall, config)),
+            materialCode: payload.code,
+        });
+    } catch (error) {
+        console.error('Errore POST material NP:', error);
+        return res.status(500).json({ error: 'Errore del server' });
+    }
+});
+
 router.post('/:townHallId/materials', requireRole(...CONFIG_EDITOR_ROLES), async (req, res) => {
     try {
         const townHall = await resolveTownHallId(req.params.townHallId);
@@ -602,7 +849,7 @@ router.post('/:townHallId/materials', requireRole(...CONFIG_EDITOR_ROLES), async
         }
         if (!(await requireTownHallEdit(req, res, townHall._id))) return;
 
-        const { code, description, udm, unitPrice, category, isStandard } = req.body || {};
+        const { code, description, fullDescription, udm, unitPrice, category, isStandard, priceType, addedBy } = req.body || {};
         if (!code || !description || unitPrice == null) {
             return res.status(400).json({ error: 'code, description e unitPrice sono obbligatori' });
         }
@@ -613,18 +860,25 @@ router.post('/:townHallId/materials', requireRole(...CONFIG_EDITOR_ROLES), async
             return res.status(409).json({ error: 'Materiale già presente con questo codice tariffa' });
         }
 
+        const resolvedPriceType = ['regional', 'user', 'capitolato'].includes(priceType)
+            ? priceType
+            : 'capitolato';
+
         config.materialCatalog.push({
             code,
             description,
-            udm: udm || 'cad',
+            fullDescription: fullDescription != null ? String(fullDescription) : '',
+            udm: normalizeUdm(udm),
             unitPrice: Number(unitPrice),
             category: category || '',
             isStandard: isStandard !== false,
+            priceType: resolvedPriceType,
+            addedBy: resolvedPriceType === 'user' ? (addedBy || '') : '',
         });
         config.updatedBy = req.currentUser._id;
         await config.save();
 
-        return res.status(201).json({ townHall, config });
+        return res.status(201).json(await configResponse(townHall, config));
     } catch (error) {
         console.error('Errore POST material:', error);
         return res.status(500).json({ error: 'Errore del server' });
@@ -649,18 +903,29 @@ router.patch('/:townHallId/materials/:code', requireRole(...CONFIG_EDITOR_ROLES)
             return res.status(404).json({ error: 'Materiale non trovato' });
         }
 
-        const { description, udm, unitPrice, category, isStandard } = req.body || {};
+        const { description, fullDescription, udm, unitPrice, category, isStandard, priceType, addedBy } = req.body || {};
         if (description !== undefined) item.description = description;
-        if (udm !== undefined) item.udm = udm;
+        if (fullDescription !== undefined) item.fullDescription = String(fullDescription || '');
+        if (udm !== undefined) item.udm = normalizeUdm(udm);
         if (unitPrice !== undefined) item.unitPrice = Number(unitPrice);
         if (category !== undefined) item.category = category;
         if (isStandard !== undefined) item.isStandard = isStandard;
+        if (priceType !== undefined) {
+            if (!['regional', 'user', 'capitolato'].includes(priceType)) {
+                return res.status(400).json({ error: 'priceType non valido' });
+            }
+            item.priceType = priceType;
+            if (priceType !== 'user') item.addedBy = '';
+        }
+        if (addedBy !== undefined && (item.priceType === 'user' || priceType === 'user')) {
+            item.addedBy = addedBy || '';
+        }
 
         config.updatedBy = req.currentUser._id;
         config.markModified('materialCatalog');
         await config.save();
 
-        return res.json({ townHall, config });
+        return res.json(await configResponse(townHall, config));
     } catch (error) {
         console.error('Errore PATCH material:', error);
         return res.status(500).json({ error: 'Errore del server' });
@@ -690,7 +955,7 @@ router.delete('/:townHallId/materials/:code', requireRole(...CONFIG_EDITOR_ROLES
         config.markModified('materialCatalog');
         await config.save();
 
-        return res.json({ townHall, config });
+        return res.json(await configResponse(townHall, config));
     } catch (error) {
         console.error('Errore DELETE material:', error);
         return res.status(500).json({ error: 'Errore del server' });
@@ -713,26 +978,24 @@ router.post('/:townHallId/import-csv', requireRole(...CONFIG_EDITOR_ROLES), asyn
         const { materials, skippedRows } = parsePrezziarioCsv(csv);
         const config = await getOrCreateActiveConfig(townHall._id, req.currentUser._id);
 
-        if (merge === true) {
-            const byCode = new Map(config.materialCatalog.map((m) => [m.code, m]));
-            for (const material of materials) {
-                byCode.set(material.code, material);
-            }
-            config.materialCatalog = [...byCode.values()];
-        } else {
-            config.materialCatalog = materials;
-        }
+        config.materialCatalog = mergeCatalogByPriceType(
+            config.materialCatalog,
+            materials,
+            'regional',
+            merge === true
+        );
+        config.materialCategories = mergeMaterialCategories(
+            config.materialCategories,
+            materials,
+            DEFAULT_MATERIAL_CATEGORIES
+        );
 
         config.updatedBy = req.currentUser._id;
         config.markModified('materialCatalog');
+        config.markModified('materialCategories');
         await config.save();
 
-        return res.json({
-            townHall,
-            config,
-            importedCount: materials.length,
-            skippedRows,
-        });
+        return res.json({ ...(await configResponse(townHall, config)), importedCount: materials.length, skippedRows });
     } catch (error) {
         console.error('Errore import-csv:', error);
         return res.status(400).json({ error: error.message || 'Errore import CSV' });
@@ -751,25 +1014,24 @@ router.post('/:townHallId/import-bra', requireRole(...CONFIG_EDITOR_ROLES), asyn
         const config = await getOrCreateActiveConfig(townHall._id, req.currentUser._id);
 
         const merge = req.body?.merge === true;
-        if (!merge) {
-            config.materialCatalog = materials;
-        } else {
-            const byCode = new Map(config.materialCatalog.map((m) => [m.code, m]));
-            for (const material of materials) {
-                byCode.set(material.code, material);
-            }
-            config.materialCatalog = [...byCode.values()];
-        }
+        config.materialCatalog = mergeCatalogByPriceType(
+            config.materialCatalog,
+            materials,
+            'capitolato',
+            merge
+        );
+        config.materialCategories = mergeMaterialCategories(
+            config.materialCategories,
+            materials,
+            DEFAULT_MATERIAL_CATEGORIES
+        );
 
         config.updatedBy = req.currentUser._id;
         config.markModified('materialCatalog');
+        config.markModified('materialCategories');
         await config.save();
 
-        return res.json({
-            townHall,
-            config,
-            importedCount: materials.length,
-        });
+        return res.json({ ...(await configResponse(townHall, config)), importedCount: materials.length });
     } catch (error) {
         console.error('Errore import-bra:', error);
         return res.status(500).json({ error: error.message || 'Errore del server' });
@@ -790,10 +1052,13 @@ router.post('/:townHallId/apply-defaults', requireRole(...CONFIG_EDITOR_ROLES), 
         config.faultLabels = defaults.faultLabels;
         config.capitolatoVersion = defaults.capitolatoVersion;
         config.standardTemplateId = defaults.standardTemplateId;
+        if (defaults.materialCategories) {
+            config.materialCategories = defaults.materialCategories;
+        }
         config.updatedBy = req.currentUser._id;
         await config.save();
 
-        return res.json({ townHall, config, validity: buildValidityMeta(config) });
+        return res.json({ ...(await configResponse(townHall, config)), validity: buildValidityMeta(config) });
     } catch (error) {
         console.error('Errore apply-defaults:', error);
         return res.status(500).json({ error: 'Errore del server' });

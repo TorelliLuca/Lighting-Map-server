@@ -1,13 +1,28 @@
 const { Schema, model } = require('mongoose');
 
+/** Sotto-voce BOM di un Nuovo Prezzo (o distinta catalogo). */
+const lineItemChildSchema = new Schema({
+    materialCode: { type: String, default: '' },
+    description: { type: String, default: '' },
+    fullDescription: { type: String, default: '' },
+    udm: { type: String, default: 'cad' },
+    quantity: { type: Number, default: 1, min: 0 },
+    unitPrice: { type: Number, default: 0, min: 0 },
+    category: { type: String, default: '' },
+    isAdHoc: { type: Boolean, default: false },
+}, { _id: false });
+
 const lineItemSchema = new Schema({
     materialCode: { type: String, default: '' },
     description: { type: String, required: true },
+    fullDescription: { type: String, default: '' },
     udm: { type: String, default: 'cad' },
     quantity: { type: Number, required: true, min: 0 },
     unitPrice: { type: Number, required: true, min: 0 },
     category: { type: String, default: '' },
     isAdHoc: { type: Boolean, default: false },
+    /** Distinta BOM (solo NP / voci composite) */
+    children: { type: [lineItemChildSchema], default: [] },
     /** Contestazione RUP sul consuntivo (voce non chiara) */
     isContested: { type: Boolean, default: false },
     contestNote: { type: String, default: '' },

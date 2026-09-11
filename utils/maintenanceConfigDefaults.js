@@ -62,6 +62,15 @@ const DEFAULT_RISK_CLASSES = [
     },
 ];
 
+const DEFAULT_MATERIAL_CATEGORIES = [
+    'A) SCAVI E OPERE EDILI',
+    'B) LINEE',
+    'C) QUADRI ELETTRICI',
+    'D) MATERIALI VARI',
+    'E) LAVORI VARI',
+    'H) MANODOPERA E NOLI',
+];
+
 function cloneDefaults() {
     return {
         capitolatoVersion: '2026 Rev00',
@@ -69,6 +78,8 @@ function cloneDefaults() {
         riskClasses: DEFAULT_RISK_CLASSES.map((item) => ({ ...item })),
         faultLabels: DEFAULT_FAULT_LABELS.map((item) => ({ ...item })),
         materialCatalog: [],
+        materialCategories: [...DEFAULT_MATERIAL_CATEGORIES],
+        regionalPriceListId: null,
         standardTemplateId: 'bra-2026-rev00',
     };
 }
@@ -76,5 +87,6 @@ function cloneDefaults() {
 module.exports = {
     DEFAULT_FAULT_LABELS,
     DEFAULT_RISK_CLASSES,
+    DEFAULT_MATERIAL_CATEGORIES,
     cloneDefaults,
 };

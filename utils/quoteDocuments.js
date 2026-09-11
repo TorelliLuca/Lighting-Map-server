@@ -37,7 +37,8 @@ function round2(n) {
 
 /**
  * Calcola totali preventivo/consuntivo.
- * subtotal → safety = subtotal * rate → discount sul (subtotal+safety) → total netto
+ * subtotal → safety = subtotal * rate
+ * → discount % su (subtotal − safety) → total netto = subtotal − discount
  */
 function computeQuoteTotals(lineItems = [], safetyChargeRate = 0.02, discountPercent = 0) {
     const subtotal = round2(
@@ -51,8 +52,9 @@ function computeQuoteTotals(lineItems = [], safetyChargeRate = 0.02, discountPer
     const safeRate = Number.isFinite(rate) ? rate : 0.02;
     const safetyAmount = round2(subtotal * safeRate);
     const discPct = Number(discountPercent) || 0;
-    const discountAmount = round2((subtotal + safetyAmount) * (discPct / 100));
-    const total = round2(subtotal + safetyAmount - discountAmount);
+    const discountBase = round2(subtotal - safetyAmount);
+    const discountAmount = round2(discountBase * (discPct / 100));
+    const total = round2(subtotal - discountAmount);
     return { subtotal, safetyAmount, discountAmount, total, safetyChargeRate: safeRate, discountPercent: discPct };
 }
 
@@ -294,24 +296,52 @@ function ensurePrintIncludesColumnF(sheet) {
 }
 
 function fillAdHocSheet(workbook, lineItems) {
-    const adHocItems = (lineItems || []).filter((i) => i.isAdHoc);
+    const adHocParents = (lineItems || []).filter((i) => i.isAdHoc);
     const adHocSheet = workbook.getWorksheet(SHEET_ADHOC);
     if (!adHocSheet) return;
 
-    if (!adHocItems.length) {
-        // Nessun nuovo prezzo: rimuovi il foglio dall'export
+    if (!adHocParents.length) {
         workbook.removeWorksheet(adHocSheet.id);
         return;
     }
 
-    adHocItems.forEach((item, idx) => {
+    // Espande la distinta: sotto-voci BOM, con fallback legacy (padre flat = 1 riga).
+    const bomRows = [];
+    for (const parent of adHocParents) {
+        const children = Array.isArray(parent.children) ? parent.children : [];
+        if (children.length > 0) {
+            for (const child of children) {
+                bomRows.push({
+                    parentCode: parent.materialCode || '',
+                    parentDescription: parent.description || '',
+                    materialCode: child.materialCode || '',
+                    description: child.description || '',
+                    udm: child.udm || '',
+                    quantity: Number(child.quantity) || 0,
+                    unitPrice: Number(child.unitPrice) || 0,
+                });
+            }
+        } else {
+            bomRows.push({
+                parentCode: parent.materialCode || '',
+                parentDescription: parent.description || '',
+                materialCode: parent.materialCode || '',
+                description: parent.description || '',
+                udm: parent.udm || '',
+                quantity: Number(parent.quantity) || 0,
+                unitPrice: Number(parent.unitPrice) || 0,
+            });
+        }
+    }
+
+    bomRows.forEach((item, idx) => {
         const row = 15 + idx;
         if (row > 34) return;
         const sheetRow = adHocSheet.getRow(row);
         sheetRow.hidden = false;
         const qty = Number(item.quantity) || 0;
         const price = Number(item.unitPrice) || 0;
-        setCell(adHocSheet, row, 1, item.materialCode || `NP-${idx + 1}`);
+        setCell(adHocSheet, row, 1, item.materialCode || `NP-${String(idx + 1).padStart(3, '0')}`);
         setCell(adHocSheet, row, 2, item.description || '');
         setCell(adHocSheet, row, 3, item.udm || '');
         setCell(adHocSheet, row, 4, qty);
@@ -319,17 +349,22 @@ function fillAdHocSheet(workbook, lineItems) {
         setCell(adHocSheet, row, 6, round2(qty * price));
         applyMaterialRowHeight(adHocSheet, row, item.description || '');
     });
-    // Nasconde e pulisce le righe residue
-    for (let row = 15 + adHocItems.length; row <= 34; row++) {
+
+    for (let row = 15 + bomRows.length; row <= 34; row++) {
         clearRowCells(adHocSheet, row);
         const sheetRow = adHocSheet.getRow(row);
         sheetRow.hidden = true;
         sheetRow.height = DEFAULT_LINE_ROW_HEIGHT;
     }
     setCell(adHocSheet, 3, 6, formatDateIt(new Date()));
-    if (adHocItems[0]) {
-        setCell(adHocSheet, 4, 1, adHocItems[0].materialCode || 'NP-1');
-        setCell(adHocSheet, 7, 1, adHocItems.map((i) => i.description).join('; '));
+    if (adHocParents[0]) {
+        setCell(adHocSheet, 4, 1, adHocParents[0].materialCode || 'NP-001');
+        setCell(
+            adHocSheet,
+            7,
+            1,
+            adHocParents.map((i) => i.description).filter(Boolean).join('; ')
+        );
     }
 }
 

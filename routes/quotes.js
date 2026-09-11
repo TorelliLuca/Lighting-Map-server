@@ -5,7 +5,8 @@ const reports = require('../schemas/reports');
 const light_points = require('../schemas/lightPoints');
 const townHalls = require('../schemas/townHalls');
 const users = require('../schemas/users');
-const { findActiveConfig } = require('../utils/maintenanceConfigHelpers');
+const { findActiveConfig, normalizeLineItemChildren, sumBomUnitPrice, emptyNpValidationError } = require('../utils/maintenanceConfigHelpers');
+const { normalizeUdm } = require('../utils/udm');
 const { STAFF_ROLES, requireRole, requireTownHallAccess, isSuperAdmin, canAccessTownHall } = require('../utils/roles');
 const { appendStatusHistory } = require('../utils/statusHistory');
 const { transitionReportStatus, resolvePlantContext } = require('../utils/reportHelpers');
@@ -62,14 +63,25 @@ function normalizeLineItems(items = [], previousItems = null) {
             contestNote = String(prev.contestNote || '').trim();
         }
 
+        const isAdHoc = Boolean(item.isAdHoc);
+        const children = isAdHoc
+            ? normalizeLineItemChildren(item)
+            : (Array.isArray(item.children) ? normalizeLineItemChildren({ ...item, isAdHoc: false }) : []);
+
+        const unitPrice = isAdHoc && children.length > 0
+            ? sumBomUnitPrice(children)
+            : (Number(item.unitPrice) || 0);
+
         return {
             materialCode,
             description,
-            udm: item.udm || 'cad',
+            fullDescription: String(item.fullDescription || '').trim(),
+            udm: normalizeUdm(item.udm),
             quantity: Number(item.quantity) || 0,
-            unitPrice: Number(item.unitPrice) || 0,
+            unitPrice,
             category: item.category || '',
-            isAdHoc: Boolean(item.isAdHoc),
+            isAdHoc,
+            children,
             isContested,
             contestNote: isContested ? contestNote : '',
         };
@@ -245,7 +257,7 @@ router.get('/', requireRole(...STAFF_ROLES), async (req, res) => {
         const list = await quotes.find(filter)
             .sort({ updatedAt: -1 })
             .populate('createdBy', 'name surname email')
-            .populate('lightPointId', 'numero_palo indirizzo')
+            .populate('lightPointId', 'numero_palo indirizzo lat lng')
             .populate('reportId', 'fault_label report_type description risk_class workflow_status is_solved report_date maintenance_category')
             .populate('townHallId', 'name')
             .populate('parentQuoteId', 'protocolNumber total status priorityClass')
@@ -575,6 +587,13 @@ router.post('/:id/submit', requireRole('MAINTAINER', 'SUPER_ADMIN'), async (req,
             return res.status(400).json({ error: 'Aggiungere almeno una voce di materiale' });
         }
 
+        if (quote.type !== 'CONSUNTIVO') {
+            const emptyNpError = emptyNpValidationError(quote.lineItems);
+            if (emptyNpError) {
+                return res.status(400).json({ error: emptyNpError });
+            }
+        }
+
         const config = await findActiveConfig(quote.townHallId);
         const minDiscountPercent = getMinimumDiscountPercent(config);
         applyTotals(
@@ -765,6 +784,13 @@ router.post('/:id/approve', requireRole('ADMINISTRATOR', 'SUPER_ADMIN'), async (
             return res.status(400).json({ error: 'Tipo documento non approvabile' });
         }
 
+        const emptyNpError = emptyNpValidationError(quote.lineItems);
+        if (emptyNpError) {
+            await session.abortTransaction();
+            session.endSession();
+            return res.status(400).json({ error: emptyNpError });
+        }
+
         const seq = await nextSequentialNumber(quote.townHallId, 'quotes', {
             prefix: 'IMS',
             padLength: 4,
@@ -938,16 +964,21 @@ router.post('/:id/reject', requireRole('ADMINISTRATOR', 'SUPER_ADMIN'), async (r
             }
             const { contestedByIndex } = parsed;
 
-            if (contestedByIndex.size === 0) {
+            if (contestedByIndex.size === 0 && !reason) {
                 return res.status(400).json({
-                    error: 'Selezionare almeno una voce non chiara e indicarne il motivo',
+                    error: 'Selezionare almeno una voce da contestare oppure indicare un motivo generale',
                 });
             }
 
-            const overallReason = reason
-                || `Voci contestate: ${[...contestedByIndex.keys()].map((i) => i + 1).join(', ')}`;
-
-            applyContestedLineItems(quote, contestedByIndex);
+            let overallReason = reason;
+            if (contestedByIndex.size > 0) {
+                applyContestedLineItems(quote, contestedByIndex);
+                overallReason = reason
+                    || `Voci contestate: ${[...contestedByIndex.keys()].map((i) => i + 1).join(', ')}`;
+            } else {
+                applyContestedLineItems(quote, new Map());
+                overallReason = reason;
+            }
 
             quote.status = 'NEEDS_REVISION';
             quote.rejectedReason = overallReason;

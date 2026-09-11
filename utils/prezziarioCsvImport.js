@@ -1,9 +1,12 @@
 const { parsePrice, normalizeCell } = require('./braCatalogImport');
+const { normalizeUdm } = require('./udm');
 
 const EXPECTED_HEADERS = [
     ['tariffa', 'code'],
+    ['descrizione breve', 'description'],
     ['descrizione articolo', 'description'],
     ['descrizione', 'description'],
+    ['descrizione completa', 'fullDescription'],
     ['u.m.', 'udm'],
     ['um', 'udm'],
     ['prezzo unitario', 'unitPrice'],
@@ -66,6 +69,9 @@ function mapHeaders(headerCells) {
 function rowToMaterial(row, headerMap) {
     const code = normalizeCell(row[headerMap.code]);
     const description = normalizeCell(row[headerMap.description]);
+    const fullDescription = headerMap.fullDescription != null
+        ? normalizeCell(row[headerMap.fullDescription])
+        : '';
     const udm = normalizeCell(row[headerMap.udm]);
     const unitPrice = parsePrice(row[headerMap.unitPrice]);
     const category = headerMap.category != null ? normalizeCell(row[headerMap.category]) : '';
@@ -77,10 +83,13 @@ function rowToMaterial(row, headerMap) {
     return {
         code,
         description,
-        udm: udm || 'cad',
+        fullDescription,
+        udm: normalizeUdm(udm),
         unitPrice,
         category: category || 'GENERALE',
         isStandard: true,
+        priceType: 'regional',
+        addedBy: '',
     };
 }
 

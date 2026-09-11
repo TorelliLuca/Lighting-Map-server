@@ -1,5 +1,6 @@
 const path = require('path');
 const XLSX = require('xlsx');
+const { normalizeUdm } = require('./udm');
 
 const DEFAULT_BRA_XLSX = path.join(
     __dirname,
@@ -38,10 +39,13 @@ function parseElencoPrezziSheet(sheet) {
         materials.push({
             code,
             description,
-            udm: udm || 'cad',
+            fullDescription: '',
+            udm: normalizeUdm(udm),
             unitPrice,
             category: category || 'GENERALE',
             isStandard: true,
+            priceType: 'capitolato',
+            addedBy: '',
         });
     }
 
