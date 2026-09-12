@@ -295,7 +295,84 @@ function ensurePrintIncludesColumnF(sheet) {
     }
 }
 
-function fillAdHocSheet(workbook, lineItems) {
+/** Righe distinta sul foglio «Nuovo Prezzo» (template: 15–28, totale in riga 29). */
+const ADHOC_LINE_START = 15;
+const ADHOC_LINE_END = 28;
+const ADHOC_MAX_LINES = ADHOC_LINE_END - ADHOC_LINE_START + 1;
+const ADHOC_TOTAL_ROW = 29;
+const ADHOC_SAFETY_ROW = 30;
+const ADHOC_NOTE_ROW = 31;
+const ADHOC_SAFETY_ROW_HEIGHT = 22;
+const EURO_NUM_FMT = '_-"€" * #,##0.00_-;-"€" * #,##0.00_-;_-"€" * "-"??_-;_-@_-';
+const BORDER_MEDIUM = { style: 'medium', color: { argb: 'FF000000' } };
+const BORDER_THIN = { style: 'thin', color: { argb: 'FF000000' } };
+
+function resolveRegionalPriceListName(config, regionalPriceListName) {
+    const fromArg = String(regionalPriceListName || '').trim();
+    if (fromArg) return fromArg;
+    const fromConfig = String(
+        config?.regionalPriceList?.name
+        || config?.regionalPriceListName
+        || ''
+    ).trim();
+    return fromConfig || null;
+}
+
+function buildAdHocPriceListNote(regionalPriceListName) {
+    const name = String(regionalPriceListName || '').trim() || 'prezzario regionale';
+    return `Per i nuovi prezzi si dovrà fare riferimento al ${name}. I prezzi saranno soggetti all'applicazione del ribasso d'asta.`;
+}
+
+/** Estende il bordo tabella fino alla riga oneri (ultima riga della griglia). */
+function styleAdHocSafetyTableRow(sheet) {
+    const totalRow = sheet.getRow(ADHOC_TOTAL_ROW);
+    totalRow.hidden = false;
+    // Il totale non chiude più la tabella: bordo inferiore sottile.
+    for (let col = 1; col <= 6; col++) {
+        const cell = sheet.getCell(ADHOC_TOTAL_ROW, col);
+        const border = { ...(cell.border || {}) };
+        border.bottom = BORDER_THIN;
+        if (col === 1) border.left = BORDER_MEDIUM;
+        if (col === 6) border.right = BORDER_MEDIUM;
+        cell.border = border;
+    }
+
+    const safetyRow = sheet.getRow(ADHOC_SAFETY_ROW);
+    safetyRow.hidden = false;
+    safetyRow.height = ADHOC_SAFETY_ROW_HEIGHT;
+
+    const baseFont = { size: 10, name: 'Arial Narrow', family: 2 };
+    for (let col = 1; col <= 6; col++) {
+        const cell = sheet.getCell(ADHOC_SAFETY_ROW, col);
+        cell.font = baseFont;
+        cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+        cell.border = {
+            top: BORDER_THIN,
+            bottom: BORDER_MEDIUM,
+            left: col === 1 ? BORDER_MEDIUM : BORDER_THIN,
+            right: col === 6 ? BORDER_MEDIUM : BORDER_THIN,
+        };
+    }
+
+    const labelCell = sheet.getCell(ADHOC_SAFETY_ROW, 5);
+    labelCell.font = { size: 9, name: 'Arial Narrow', family: 2 };
+    labelCell.alignment = { horizontal: 'right', vertical: 'middle', wrapText: true };
+
+    const valueCell = sheet.getCell(ADHOC_SAFETY_ROW, 6);
+    valueCell.numFmt = EURO_NUM_FMT;
+    valueCell.font = baseFont;
+    valueCell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+}
+
+/**
+ * @param {import('exceljs').Workbook} workbook
+ * @param {object[]} lineItems
+ * @param {object} [options]
+ * @param {number} [options.safetyChargeRate]
+ * @param {object} [options.config]
+ * @param {string} [options.regionalPriceListName]
+ */
+function fillAdHocSheet(workbook, lineItems, options = {}) {
     const adHocParents = (lineItems || []).filter((i) => i.isAdHoc);
     const adHocSheet = workbook.getWorksheet(SHEET_ADHOC);
     if (!adHocSheet) return;
@@ -304,6 +381,16 @@ function fillAdHocSheet(workbook, lineItems) {
         workbook.removeWorksheet(adHocSheet.id);
         return;
     }
+
+    const rateRaw = Number(options.safetyChargeRate);
+    const safetyRate = Number.isFinite(rateRaw) ? rateRaw : 0.02;
+    const safetyPctLabel = Number.isInteger(safetyRate * 100)
+        ? String(Math.round(safetyRate * 100))
+        : String(round2(safetyRate * 100));
+    const regionalName = resolveRegionalPriceListName(
+        options.config,
+        options.regionalPriceListName
+    );
 
     // Espande la distinta: sotto-voci BOM, con fallback legacy (padre flat = 1 riga).
     const bomRows = [];
@@ -334,28 +421,46 @@ function fillAdHocSheet(workbook, lineItems) {
         }
     }
 
-    bomRows.forEach((item, idx) => {
-        const row = 15 + idx;
-        if (row > 34) return;
+    const sliced = bomRows.slice(0, ADHOC_MAX_LINES);
+    let npTotal = 0;
+
+    sliced.forEach((item, idx) => {
+        const row = ADHOC_LINE_START + idx;
         const sheetRow = adHocSheet.getRow(row);
         sheetRow.hidden = false;
         const qty = Number(item.quantity) || 0;
         const price = Number(item.unitPrice) || 0;
+        const lineTotal = round2(qty * price);
+        npTotal = round2(npTotal + lineTotal);
         setCell(adHocSheet, row, 1, item.materialCode || `NP-${String(idx + 1).padStart(3, '0')}`);
         setCell(adHocSheet, row, 2, item.description || '');
         setCell(adHocSheet, row, 3, item.udm || '');
         setCell(adHocSheet, row, 4, qty);
         setCell(adHocSheet, row, 5, price);
-        setCell(adHocSheet, row, 6, round2(qty * price));
+        setCell(adHocSheet, row, 6, lineTotal);
         applyMaterialRowHeight(adHocSheet, row, item.description || '');
     });
 
-    for (let row = 15 + bomRows.length; row <= 34; row++) {
+    // Nasconde solo le righe distinta vuote: non toccare totale / oneri / note.
+    for (let row = ADHOC_LINE_START + sliced.length; row <= ADHOC_LINE_END; row++) {
         clearRowCells(adHocSheet, row);
         const sheetRow = adHocSheet.getRow(row);
         sheetRow.hidden = true;
         sheetRow.height = DEFAULT_LINE_ROW_HEIGHT;
     }
+
+    const totalRow = adHocSheet.getRow(ADHOC_TOTAL_ROW);
+    totalRow.hidden = false;
+    // Valore esplicito: la formula SUM del template può andare persa dopo la riscrittura ExcelJS.
+    setCell(adHocSheet, ADHOC_TOTAL_ROW, 6, npTotal);
+
+    const safetyAmount = round2(npTotal * safetyRate);
+    setCell(adHocSheet, ADHOC_SAFETY_ROW, 5, `di cui oneri di sicurezza ${safetyPctLabel}%`);
+    setCell(adHocSheet, ADHOC_SAFETY_ROW, 6, safetyAmount);
+    styleAdHocSafetyTableRow(adHocSheet);
+
+    setCell(adHocSheet, ADHOC_NOTE_ROW, 1, buildAdHocPriceListNote(regionalName));
+
     setCell(adHocSheet, 3, 6, formatDateIt(new Date()));
     if (adHocParents[0]) {
         setCell(adHocSheet, 4, 1, adHocParents[0].materialCode || 'NP-001');
@@ -384,6 +489,7 @@ function removeCatalogSheet(workbook) {
  * @param {object} [ctx.report]
  * @param {object} [ctx.lightPoint]
  * @param {object} [ctx.config] - maintenanceConfig
+ * @param {string} [ctx.regionalPriceListName] - nome prezzario regionale del comune
  * @param {object} [ctx.townHall] - { name }
  * @param {object} [ctx.approver] - { name, surname } se approvato
  * @param {Date|string} [ctx.operationDate] - data chiusura intervento (consuntivo)
@@ -413,19 +519,28 @@ async function fillImsWorkbook(ctx) {
     const isConsuntivo = quote.type === 'CONSUNTIVO';
     const preventivoSource = isConsuntivo ? (parentQuote || quote) : quote;
     const headerCtx = { report, lightPoint, config, approver, townHall };
+    const adHocOptions = {
+        safetyChargeRate: preventivoSource.safetyChargeRate ?? quote.safetyChargeRate ?? 0.02,
+        config,
+        regionalPriceListName: ctx.regionalPriceListName,
+    };
 
     fillPreventivoSection(sheet, preventivoSource, headerCtx);
 
     if (isConsuntivo) {
         fillConsuntivoSection(sheet, quote, { operationDate });
         sheet.pageSetup.printArea = `A1:F${SHEET_LAST_ROW}`;
-        fillAdHocSheet(workbook, [
-            ...(preventivoSource.lineItems || []),
-            ...(quote.lineItems || []),
-        ]);
+        fillAdHocSheet(
+            workbook,
+            [
+                ...(preventivoSource.lineItems || []),
+                ...(quote.lineItems || []),
+            ],
+            adHocOptions
+        );
     } else {
         collapseConsuntivoSection(sheet);
-        fillAdHocSheet(workbook, quote.lineItems);
+        fillAdHocSheet(workbook, quote.lineItems, adHocOptions);
     }
 
     ensurePrintIncludesColumnF(sheet);

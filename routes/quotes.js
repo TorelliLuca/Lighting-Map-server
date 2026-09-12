@@ -1310,7 +1310,26 @@ async function buildDocumentContext(quote) {
             ? quotes.findById(quote.parentQuoteId)
             : null,
     ]);
-    return { quote, parentQuote, report, lightPoint, config, townHall: th, approver };
+
+    let regionalPriceListName = null;
+    if (config?.regionalPriceListId) {
+        const RegionalPriceList = require('../schemas/regionalPriceList');
+        const regionalList = await RegionalPriceList.findById(config.regionalPriceListId)
+            .select('name')
+            .lean();
+        regionalPriceListName = regionalList?.name || null;
+    }
+
+    return {
+        quote,
+        parentQuote,
+        report,
+        lightPoint,
+        config,
+        townHall: th,
+        approver,
+        regionalPriceListName,
+    };
 }
 
 function safeDownloadFilename(baseName, extension) {
