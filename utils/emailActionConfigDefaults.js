@@ -21,7 +21,7 @@ const DEFAULT_ACTIONS = [
     {
         actionKey: 'EMAIL_CONFIRMATION',
         label: 'Conferma email',
-        description: 'Invio link di conferma account. Non disattivabile.',
+        description: 'Invio link di conferma account (usato da sendConfirmationEmail). Non disattivabile.',
         enabled: true,
         locked: true,
         audience: { mode: 'recipients', userTypes: [], subRoles: [] },
@@ -72,7 +72,8 @@ const DEFAULT_ACTIONS = [
         subjectTemplate: 'Account validato — Lighting Map',
         bodyTemplate: wrapEmail('Account validato', `
           <p>Ciao <strong>{{nome}} {{cognome}}</strong>,</p>
-          <p>Il tuo account è stato validato. Ora puoi utilizzare Lighting Map.</p>
+          <p>Il tuo account è stato validato da un amministratore.</p>
+          <p>Se hai già confermato l'indirizzo email, puoi accedere a Lighting Map. Altrimenti apri prima il link di conferma ricevuto via email (o richiedine uno nuovo dal login).</p>
         `),
         allowedPlaceholders: [...COMMON_USER],
     },

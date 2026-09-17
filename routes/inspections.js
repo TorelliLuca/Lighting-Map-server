@@ -10,7 +10,7 @@ const users = require('../schemas/users');
 const MaintenanceConfig = require('../schemas/maintenanceConfig');
 const { getAllPuntiLuce } = require('../utils/lightPointHelpers');
 const { STAFF_ROLES, requireRole, requireTownHallAccess } = require('../utils/roles');
-const { transitionReportStatus, resolvePlantContext } = require('../utils/reportHelpers');
+const { transitionReportStatus, resolvePlantContext, assertFaultLabelForMarker } = require('../utils/reportHelpers');
 const { appendStatusHistory } = require('../utils/statusHistory');
 const {
     createNotifications,
@@ -54,10 +54,19 @@ router.post('/', requireRole('MAINTAINER', 'SUPER_ADMIN', 'ADMINISTRATOR'), asyn
             notes,
         } = req.body || {};
 
-        if (!name || !numero_palo || !report_id || !outcome) {
+        if (!name || !numero_palo || !outcome) {
             await session.abortTransaction();
             session.endSession();
-            return res.status(400).json({ error: 'name, numero_palo, report_id e outcome sono obbligatori' });
+            return res.status(400).json({ error: 'name, numero_palo e outcome sono obbligatori' });
+        }
+
+        const isDirectDiscovery = !report_id;
+        if (isDirectDiscovery && (!fault_label || !risk_class)) {
+            await session.abortTransaction();
+            session.endSession();
+            return res.status(400).json({
+                error: 'Per un sopralluogo diretto senza segnalazione iniziale servono fault_label e risk_class',
+            });
         }
 
         const lookup = await findLightPointInTownHall(name, numero_palo);
@@ -81,6 +90,14 @@ router.post('/', requireRole('MAINTAINER', 'SUPER_ADMIN', 'ADMINISTRATOR'), asyn
             return res.status(404).json({ error: 'Utente non trovato' });
         }
 
+        if (isDirectDiscovery && !['MAINTAINER', 'SUPER_ADMIN'].includes(inspector.user_type)) {
+            await session.abortTransaction();
+            session.endSession();
+            return res.status(403).json({
+                error: 'Solo il manutentore può aprire un sopralluogo senza segnalazione iniziale',
+            });
+        }
+
         const puntoLuceDoc = await light_points.findById(puntoLuce._id).populate('segnalazioni_in_corso');
         if (!puntoLuceDoc) {
             await session.abortTransaction();
@@ -88,58 +105,130 @@ router.post('/', requireRole('MAINTAINER', 'SUPER_ADMIN', 'ADMINISTRATOR'), asyn
             return res.status(404).json({ error: 'Punto luce non trovato' });
         }
 
-        const report = (puntoLuceDoc.segnalazioni_in_corso || []).find(
-            (item) => String(item._id) === String(report_id)
-        );
-        if (!report) {
-            await session.abortTransaction();
-            session.endSession();
-            return res.status(404).json({ error: 'Segnalazione non trovata o già chiusa' });
-        }
+        let report = null;
+        let classificationModified = false;
 
-        if (report.maintenance_category === 'EXTRAORDINARY') {
-            await session.abortTransaction();
-            session.endSession();
-            return res.status(400).json({ error: 'Il sopralluogo ordinario non è applicabile a segnalazioni straordinarie' });
-        }
+        if (isDirectDiscovery) {
+            const existingOrdinaryOpen = (puntoLuceDoc.segnalazioni_in_corso || []).find((item) => {
+                if (item?.is_solved) return false;
+                return item?.maintenance_category !== 'EXTRAORDINARY';
+            });
+            if (existingOrdinaryOpen) {
+                await session.abortTransaction();
+                session.endSession();
+                return res.status(409).json({
+                    error: 'Esiste già una segnalazione ordinaria aperta su questo punto',
+                    reportId: existingOrdinaryOpen._id,
+                });
+            }
 
-        const inspectableStatuses = new Set(['OPEN', 'CLASSIFICATION_PENDING']);
-        const currentStatus = report.workflow_status || 'OPEN';
-        if (!inspectableStatuses.has(currentStatus)) {
-            await session.abortTransaction();
-            session.endSession();
-            return res.status(400).json({ error: 'Sopralluogo già effettuato per questa segnalazione' });
-        }
+            if (fault_label) {
+                const check = await assertFaultLabelForMarker({
+                    townHallId: th._id,
+                    faultLabel: fault_label,
+                    marker: puntoLuce.marker,
+                });
+                if (!check.ok) {
+                    await session.abortTransaction();
+                    session.endSession();
+                    return res.status(400).json({ error: check.error });
+                }
+            }
 
-        const existingInspection = await inspections.findOne({ reportId: report._id }).session(session);
-        if (existingInspection) {
-            await session.abortTransaction();
-            session.endSession();
-            return res.status(409).json({ error: 'Esiste già un sopralluogo per questa segnalazione' });
-        }
+            const plantContext = await resolvePlantContext(puntoLuce, th);
+            const resolvedType = report_type || fault_label;
+            report = new reports({
+                operation_point_id: puntoLuceDoc._id,
+                user_creator_id: inspector._id,
+                report_type: resolvedType,
+                description: notes || 'Guasto rilevato dal manutentore in sopralluogo diretto',
+                report_date: new Date(),
+                maintenance_category: 'ORDINARY',
+                workflow_status: 'OPEN',
+                risk_class,
+                fault_label,
+                classification: {
+                    status: 'CONFIRMED',
+                    confirmedBy: inspector._id,
+                    confirmedAt: new Date(),
+                },
+                plant_context: plantContext,
+                town_hall_id: th._id,
+            });
+            appendStatusHistory(report, {
+                status: 'OPEN',
+                by: inspector._id,
+                note: 'Sopralluogo diretto — nessuna segnalazione iniziale',
+            });
+            await report.save({ session });
+            puntoLuceDoc.segnalazioni_in_corso.push(report);
+        } else {
+            report = (puntoLuceDoc.segnalazioni_in_corso || []).find(
+                (item) => String(item._id) === String(report_id)
+            );
+            if (!report) {
+                await session.abortTransaction();
+                session.endSession();
+                return res.status(404).json({ error: 'Segnalazione non trovata o già chiusa' });
+            }
 
-        const previousRisk = report.risk_class;
-        const previousFault = report.fault_label;
-        const classificationModified =
-            (risk_class && risk_class !== report.risk_class)
-            || (fault_label && fault_label !== report.fault_label);
+            if (report.maintenance_category === 'EXTRAORDINARY') {
+                await session.abortTransaction();
+                session.endSession();
+                return res.status(400).json({ error: 'Il sopralluogo ordinario non è applicabile a segnalazioni straordinarie' });
+            }
 
-        if (risk_class) report.risk_class = risk_class;
-        if (fault_label) {
-            report.fault_label = fault_label;
-            // Preferisci report_type esplicito, altrimenti il codice capitolato
-            report.report_type = report_type || fault_label;
-        } else if (report_type) {
-            report.report_type = report_type;
-        }
+            const inspectableStatuses = new Set(['OPEN', 'CLASSIFICATION_PENDING']);
+            const currentStatus = report.workflow_status || 'OPEN';
+            if (!inspectableStatuses.has(currentStatus)) {
+                await session.abortTransaction();
+                session.endSession();
+                return res.status(400).json({ error: 'Sopralluogo già effettuato per questa segnalazione' });
+            }
 
-        report.classification = report.classification || {};
-        report.classification.status = classificationModified ? 'MODIFIED' : 'CONFIRMED';
-        report.classification.confirmedBy = inspector._id;
-        report.classification.confirmedAt = new Date();
-        if (classificationModified) {
-            report.classification.previousRiskClass = previousRisk;
-            report.classification.previousFaultLabel = previousFault;
+            const existingInspection = await inspections.findOne({ reportId: report._id }).session(session);
+            if (existingInspection) {
+                await session.abortTransaction();
+                session.endSession();
+                return res.status(409).json({ error: 'Esiste già un sopralluogo per questa segnalazione' });
+            }
+
+            const previousRisk = report.risk_class;
+            const previousFault = report.fault_label;
+            classificationModified =
+                (risk_class && risk_class !== report.risk_class)
+                || (fault_label && fault_label !== report.fault_label);
+
+            if (fault_label && fault_label !== previousFault) {
+                const check = await assertFaultLabelForMarker({
+                    townHallId: th._id,
+                    faultLabel: fault_label,
+                    marker: puntoLuce.marker,
+                });
+                if (!check.ok) {
+                    await session.abortTransaction();
+                    session.endSession();
+                    return res.status(400).json({ error: check.error });
+                }
+            }
+
+            if (risk_class) report.risk_class = risk_class;
+            if (fault_label) {
+                report.fault_label = fault_label;
+                // Preferisci report_type esplicito, altrimenti il codice capitolato
+                report.report_type = report_type || fault_label;
+            } else if (report_type) {
+                report.report_type = report_type;
+            }
+
+            report.classification = report.classification || {};
+            report.classification.status = classificationModified ? 'MODIFIED' : 'CONFIRMED';
+            report.classification.confirmedBy = inspector._id;
+            report.classification.confirmedAt = new Date();
+            if (classificationModified) {
+                report.classification.previousRiskClass = previousRisk;
+                report.classification.previousFaultLabel = previousFault;
+            }
         }
 
         let operationId = null;

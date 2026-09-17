@@ -22,7 +22,11 @@ const {
     normalizeBomList,
     sumBomUnitPrice,
 } = require('../utils/maintenanceConfigHelpers');
-const { cloneDefaults, DEFAULT_MATERIAL_CATEGORIES } = require('../utils/maintenanceConfigDefaults');
+const {
+    cloneDefaults,
+    DEFAULT_MATERIAL_CATEGORIES,
+    normalizeFaultLabelsList,
+} = require('../utils/maintenanceConfigDefaults');
 const { importMaterialCatalogFromBra } = require('../utils/braCatalogImport');
 const { parsePrezziarioCsv } = require('../utils/prezziarioCsvImport');
 const { normalizeUdm } = require('../utils/udm');
@@ -90,6 +94,10 @@ function applyEditableFields(target, body, userId) {
                 throw error;
             }
             target.linkedOrganizations = normalized.value;
+            continue;
+        }
+        if (field === 'faultLabels') {
+            target.faultLabels = normalizeFaultLabelsList(body.faultLabels, { mergeDefaults: false });
             continue;
         }
         target[field] = body[field];

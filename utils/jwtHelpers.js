@@ -30,6 +30,8 @@ function resolveRefreshWindow(rememberMe) {
     return process.env.JWT_SESSION_REFRESH_WINDOW || DEFAULT_SESSION_REFRESH_WINDOW;
 }
 
+const ACCESS_TOKEN_PURPOSE = 'access';
+
 function signAccessToken(user, rememberMe = false) {
     return jwt.sign(
         {
@@ -38,6 +40,7 @@ function signAccessToken(user, rememberMe = false) {
             name: user.name,
             surname: user.surname,
             rememberMe: Boolean(rememberMe),
+            purpose: ACCESS_TOKEN_PURPOSE,
         },
         process.env.JWT_SECRET,
         { expiresIn: resolveExpiresIn(rememberMe) }
@@ -49,6 +52,7 @@ function getRefreshGraceSeconds(rememberMe) {
 }
 
 module.exports = {
+    ACCESS_TOKEN_PURPOSE,
     DEFAULT_SESSION_EXPIRES_IN,
     DEFAULT_REMEMBER_EXPIRES_IN,
     parseDurationToSeconds,

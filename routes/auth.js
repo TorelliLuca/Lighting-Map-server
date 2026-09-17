@@ -1,52 +1,104 @@
 const express = require('express');
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
 const users = require('../schemas/users');
 const { debugMail } = require('../config/email');
 const accessLogger = require('../middleware/accessLogger');
 const logAccess = require('../utils/accessLogger');
 const { signAccessToken } = require('../utils/jwtHelpers');
+const { validatePasswordStrength, normalizeEmail } = require('../utils/passwordPolicy');
+const {
+    createResetPasswordToken,
+    hashResetPasswordToken,
+    getFrontendBaseUrl,
+} = require('../utils/resetPasswordToken');
 const router = express.Router();
 const borders = require("./../schemas/borders");
 
-// Rate limiting per invio mail di reset password (max 1 richiesta/30s per email)
 const RateLimit = require('express-rate-limit');
-const resetPasswordLimiter = RateLimit({
-    windowMs: 30 * 1000, // 30 secondi
-    max: 1,
-    keyGenerator: (req) => req.body.email || req.ip,
-    message: 'Hai raggiunto il limite di richieste per il reset password. Riprova più tardi.'
-});
-// Richiesta reset password
-router.post('/forgot-password', resetPasswordLimiter, async (req, res) => {
-    const { email } = req.body;
-    if (!email) return res.status(400).send('Email richiesta');
-    try {
-        const user = await users.findOne({ email });
-        if (!user) return res.status(200).send('Se l\'email è registrata riceverai istruzioni per il reset.'); // risposta generica
-        // Genera token JWT valido 1 ora
-        const token = jwt.sign({ id: user._id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '1h' });
-        user.resetPasswordToken = token;
-        user.resetPasswordExpires = Date.now() + 3600000;
-        await user.save();
-        const resetUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/reset-password?token=${token}`;
-        const { sendResetPasswordEmail } = require('../utils/emailHelpers');
-        await sendResetPasswordEmail(user, resetUrl);
-        res.status(200).send('Se l\'email è registrata riceverai istruzioni per il reset.');
-    } catch (e) {
-        console.log(e);
-        res.status(500).send('Errore invio email');
-    }
+
+const GENERIC_FORGOT_MSG = 'Se l\'email è registrata riceverai istruzioni per il reset.';
+
+// Limite per IP: mitiga spray su molte email
+const forgotPasswordIpLimiter = RateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: 'Hai raggiunto il limite di richieste per il reset password. Riprova più tardi.',
 });
 
+// Limite per email: evita flood sulla stessa casella
+const forgotPasswordEmailLimiter = RateLimit({
+    windowMs: 60 * 1000,
+    max: 1,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => normalizeEmail(req.body?.email) || req.ip,
+    message: 'Hai raggiunto il limite di richieste per il reset password. Riprova più tardi.',
+});
+
+const resetPasswordSubmitLimiter = RateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: 'Troppi tentativi di reset password. Riprova più tardi.',
+});
+
+async function findUserByEmailInsensitive(email) {
+    const normalized = normalizeEmail(email);
+    if (!normalized) return null;
+    return users.findOne({
+        $expr: { $eq: [{ $toLower: '$email' }, normalized] },
+    });
+}
+
+// Richiesta reset password
+router.post(
+    '/forgot-password',
+    forgotPasswordIpLimiter,
+    forgotPasswordEmailLimiter,
+    async (req, res) => {
+        const email = normalizeEmail(req.body?.email);
+        if (!email) return res.status(400).send('Email richiesta');
+        try {
+            const user = await findUserByEmailInsensitive(email);
+            if (!user) {
+                await new Promise((r) => setTimeout(r, 200 + Math.floor(Math.random() * 200)));
+                return res.status(200).send(GENERIC_FORGOT_MSG);
+            }
+
+            const { rawToken, hashedToken, expiresAt } = createResetPasswordToken();
+            user.resetPasswordToken = hashedToken;
+            user.resetPasswordExpires = expiresAt;
+            await user.save();
+
+            const resetUrl = `${getFrontendBaseUrl()}/reset-password?token=${encodeURIComponent(rawToken)}`;
+            const { sendResetPasswordEmail } = require('../utils/emailHelpers');
+            await sendResetPasswordEmail(user, resetUrl);
+            res.status(200).send(GENERIC_FORGOT_MSG);
+        } catch (e) {
+            console.log(e);
+            // Non rivelare dettagli (es. fallimento SMTP) per anti-enumerazione
+            res.status(200).send(GENERIC_FORGOT_MSG);
+        }
+    }
+);
+
 // Reset password effettivo
-router.post('/reset-password', async (req, res) => {
+router.post('/reset-password', resetPasswordSubmitLimiter, async (req, res) => {
     const { token, password } = req.body;
     if (!token || !password) return res.status(400).send('Token e nuova password richiesti');
+
+    const passwordError = validatePasswordStrength(password);
+    if (passwordError) return res.status(400).send(passwordError);
+
     try {
-        const payload = jwt.verify(token, process.env.JWT_SECRET);
-        const user = await users.findById(payload.id);
-        if (!user || user.resetPasswordToken !== token || !user.resetPasswordExpires || user.resetPasswordExpires < Date.now()) {
+        const hashedToken = hashResetPasswordToken(token);
+        const user = await users.findOne({
+            resetPasswordToken: hashedToken,
+            resetPasswordExpires: { $gt: new Date() },
+        });
+        if (!user) {
             return res.status(400).send('Token non valido o scaduto');
         }
         user.password = password;
@@ -55,6 +107,7 @@ router.post('/reset-password', async (req, res) => {
         await user.save();
         res.send('Password aggiornata con successo');
     } catch (e) {
+        console.error(e);
         res.status(400).send('Token non valido o scaduto');
     }
 });
@@ -72,22 +125,35 @@ async function validateUserForLogin(user, password) {
         return { error: 'Credenziali non valide' };
     }
 
+    // Conferma email prima dell'approvazione admin: consente reinvio link
+    if (!user.emailVerified) {
+        const { sendConfirmationEmail } = require("../utils/emailHelpers");
+        try {
+            await sendConfirmationEmail(user);
+        } catch (e) {
+            return {
+                error: e.message || "Account non verificato. Riprova più tardi a richiedere il link di conferma.",
+                code: 'EMAIL_NOT_VERIFIED',
+            };
+        }
+        return {
+            error: "L'account non è ancora verificato. Controlla la posta (anche nello spam) o richiedi un nuovo link.",
+            code: 'EMAIL_NOT_VERIFIED',
+        };
+    }
+
     if (!user.is_approved) {
         return { error: 'Utente non ancora approvato' };
     }
 
-    if (!user.emailVerified) {
-        const { sendConfirmationEmail } = require("../utils/emailHelpers");
-        try{
-            await sendConfirmationEmail(user);
-        }catch(e){
-            //console.log(e);
-            return {error: e.message}
-        }
-        return { error: `L'account non è ancora verificato, abbiamo inviato un link a ${user.email}. Controlla la posta (anche nello spam)` };
-    }
-
     return { user };
+}
+
+function sendLoginValidationError(res, validation) {
+    if (validation.code) {
+        return res.status(400).json({ message: validation.error, code: validation.code });
+    }
+    return res.status(400).send(validation.error);
 }
 
 // Login routes
@@ -97,9 +163,10 @@ router.post('/login', async function (req, res) {
     }
 
     try {
-        const user = await users.findOne({email: {$eq: req.body.email}}).populate('town_halls_list');
+        let user = await findUserByEmailInsensitive(req.body.email);
+        if (user) user = await user.populate('town_halls_list');
         const validation = await validateUserForLogin(user, req.body.password);
-        if (validation.error) return res.status(400).send(validation.error);
+        if (validation.error) return sendLoginValidationError(res, validation);
         const rememberMe = Boolean(req.body.rememberMe);
         const token = signAccessToken(user, rememberMe);
         await logAccess({
@@ -154,11 +221,26 @@ router.post('/adminLogin', accessLogger('ADMIN_LOGIN'), async function (req, res
     }
 
     try {
-        const user = await users.findOne({email: {$eq: req.body.email}}).populate('town_halls_list');
+        let user = await findUserByEmailInsensitive(req.body.email);
+        if (user) user = await user.populate('town_halls_list');
         const validation = await validateUserForLogin(user, req.body.password);
-        if (validation.error) return res.status(400).send(validation.error);
+        if (validation.error) return sendLoginValidationError(res, validation);
         if (user.user_type !== 'SUPER_ADMIN') return res.status(400).send('Permessi insufficienti');
-        res.json({ user });
+        res.json({
+            user: {
+                id: user._id,
+                name: user.name,
+                surname: user.surname,
+                email: user.email,
+                is_approved: user.is_approved,
+                user_type: user.user_type,
+                sub_role: user.sub_role || null,
+                town_halls_list: user.town_halls_list,
+                id_organization: user.id_organization,
+                emailVerified: user.emailVerified,
+                date: user.date,
+            },
+        });
     } catch (err) {
         console.error(err);
         res.status(500).send('Errore del server');
@@ -171,14 +253,20 @@ router.post('/addPendingUser', async function (req, res) {
         return res.status(400).send('id, name, surname, email, and password are required');
     }
 
+    const passwordError = validatePasswordStrength(req.body.password);
+    if (passwordError) return res.status(400).send(passwordError);
+
+    const email = normalizeEmail(req.body.email);
+    if (!email) return res.status(400).send('Email non valida');
+
     try {
-        const existingUsr = await users.findOne({email: {$eq: req.body.email}});
+        const existingUsr = await findUserByEmailInsensitive(email);
         if (existingUsr) return res.status(400).send('Email già in uso');
 
         const newUser = new users({
             name: req.body.name,
             surname: req.body.surname,
-            email: req.body.email,
+            email,
             password: req.body.password,
             is_approved: false,
             emailVerified: false,
@@ -189,14 +277,20 @@ router.post('/addPendingUser', async function (req, res) {
 
         // Invio email di conferma centralizzato
         const { sendConfirmationEmail } = require('../utils/emailHelpers');
+        let emailSent = true;
         try {
             await sendConfirmationEmail(newUser);
         } catch (e) {
             console.log(e);
-            // Non bloccare la registrazione se la mail fallisce
+            emailSent = false;
         }
 
-        res.status(201).send("Utente registrato con successo. Controlla la mail per confermare.");
+        res.status(201).json({
+            message: emailSent
+                ? "Utente registrato con successo. Controlla la mail per confermare."
+                : "Utente registrato, ma non siamo riusciti a inviare la mail di conferma. Usa 'Rinvia email' dal login.",
+            emailSent,
+        });
     } catch (err) {
         console.error(err);
         res.status(500).send('Errore del server');
@@ -220,20 +314,95 @@ if (process.env.NODE_ENV !== 'production') {
     });
 }
 
-// Conferma email tramite token
+// Conferma email tramite token opaco one-time
 router.get('/confirm-email', async (req, res) => {
     const { token } = req.query;
-    if (!token) return res.status(400).send('Token mancante');
+    if (!token || typeof token !== 'string') return res.status(400).send('Token mancante');
     try {
-        const payload = jwt.verify(token, process.env.JWT_SECRET);
-        const user = await users.findById(payload.id);
-        if (!user) return res.status(404).send('Utente non trovato');
-        if (user.emailVerified) return res.status(400).send('Email già verificata');
-        user.emailVerified = true;
-        await user.save();
+        const { hashEmailConfirmToken } = require('../utils/emailConfirmToken');
+        const hashedToken = hashEmailConfirmToken(token);
+
+        const user = await users.findOne({
+            emailConfirmToken: hashedToken,
+            emailConfirmExpires: { $gt: new Date() },
+        });
+
+        if (!user) {
+            // Idempotenza: se già verificato con questo flusso, oppure token già consumato
+            // Non rivelare dettagli: messaggio generico se non trovato
+            return res.status(400).send('Token non valido o scaduto');
+        }
+
+        if (user.emailVerified) {
+            user.emailConfirmToken = null;
+            user.emailConfirmExpires = null;
+            await user.save();
+            return res.send('Email confermata con successo');
+        }
+
+        const updated = await users.findOneAndUpdate(
+            {
+                _id: user._id,
+                emailConfirmToken: hashedToken,
+                emailVerified: false,
+            },
+            {
+                $set: {
+                    emailVerified: true,
+                    emailConfirmToken: null,
+                    emailConfirmExpires: null,
+                },
+            },
+            { new: true }
+        );
+
+        if (!updated) {
+            const current = await users.findById(user._id);
+            if (current?.emailVerified) {
+                return res.send('Email confermata con successo');
+            }
+            return res.status(400).send('Token non valido o scaduto');
+        }
+
         res.send('Email confermata con successo');
     } catch (e) {
+        console.error(e);
         res.status(400).send('Token non valido o scaduto');
+    }
+});
+
+// Reinvio conferma email (pubblico, rate-limited; risposta generica anti-enumeration)
+const confirmationResendLimiter = RateLimit({
+    windowMs: 5 * 60 * 1000,
+    max: 1,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => normalizeEmail(req.body?.email) || req.ip || 'unknown',
+    message: 'Hai raggiunto il limite di richieste per questa email. Riprova più tardi.',
+});
+
+router.post('/send-confirmation', confirmationResendLimiter, async (req, res) => {
+    const email = normalizeEmail(req.body?.email);
+    if (!email) return res.status(400).send('Email richiesta');
+
+    const genericOk = 'Se l\'email è registrata e non ancora verificata, riceverai un link di conferma.';
+    try {
+        const user = await findUserByEmailInsensitive(email);
+        if (user && !user.emailVerified) {
+            const { sendConfirmationEmail } = require('../utils/emailHelpers');
+            try {
+                await sendConfirmationEmail(user);
+            } catch (e) {
+                if (e.message && e.message.includes('limite di invii')) {
+                    return res.status(429).send(e.message);
+                }
+                console.log(e);
+            }
+        }
+        res.send(genericOk);
+    } catch (e) {
+        console.error(e);
+        res.status(500).send('Errore invio email');
     }
 });
 

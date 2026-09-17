@@ -24,8 +24,35 @@ const {
     previewLightPointsImport
 } = require('../utils/lightPointCsv');
 const { createNotificationsForEmails, safeNotify } = require('../utils/notificationHelpers');
+const {
+    loadRequestUser,
+    isSuperAdmin,
+    requireRole,
+    requireTownHallAccess,
+    requireTownHallAccessByName,
+} = require('../utils/roles');
 
 const router = express.Router();
+
+const requireSuperAdmin = requireRole('SUPER_ADMIN');
+const requireLightPointEditor = requireRole('SUPER_ADMIN', 'SURVEYOR');
+
+const LP_UPDATE_BLOCKLIST = new Set([
+    '_id',
+    '__v',
+    'segnalazioni_in_corso',
+    'operazioni_effettuate',
+]);
+
+function sanitizeLightPointUpdate(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+    const cleaned = {};
+    for (const [key, value] of Object.entries(raw)) {
+        if (LP_UPDATE_BLOCKLIST.has(key)) continue;
+        cleaned[key] = value;
+    }
+    return cleaned;
+}
 
 function chunkArray(array, size) {
     const result = [];
@@ -252,7 +279,7 @@ function formatCoordErrorsHtml(coordErrors) {
 }
 
 
-router.post('/', async (req, res) => {
+router.post('/', requireSuperAdmin, async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
     let batchStatus = [];
@@ -493,7 +520,7 @@ router.post('/', async (req, res) => {
     }
 });
 
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', requireSuperAdmin, async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
     try {
@@ -574,7 +601,7 @@ function returnHtmlEmailUpdateSuccessSummary(nomeComune, eliminati, modificati, 
  * Dry-run import CSV: anteprima colonne/righe accettate vs scartate (senza scrivere).
  * Body: { light_points: [...], mode: 'create'|'update', name? }
  */
-router.post('/preview-import', async (req, res) => {
+router.post('/preview-import', requireSuperAdmin, async (req, res) => {
     try {
         const lightPoints = req.body?.light_points;
         if (!Array.isArray(lightPoints)) {
@@ -604,7 +631,7 @@ router.post('/preview-import', async (req, res) => {
     }
 });
 
-router.post('/update/', async (req, res) => {
+router.post('/update/', requireSuperAdmin, async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
     let responseStatus = 200;
@@ -928,10 +955,16 @@ router.post('/update/', async (req, res) => {
     }
 });
 
-router.patch('/lightPoints/update/:_id', async (req, res) => {
-
+router.patch('/lightPoints/update/:_id', requireLightPointEditor, async (req, res) => {
     const _id = req.params._id;
-    const lpToUpdate = { ...req.body };
+
+    const townHall = await townHalls.findOne({ punti_luce: _id }).select('_id').lean();
+    if (!townHall) {
+        return res.status(404).send('Punto luce non trovato o non associato a un comune.');
+    }
+    if (!(await requireTownHallAccess(req, res, townHall._id))) return;
+
+    const lpToUpdate = sanitizeLightPointUpdate(req.body);
 
     const coordErrors = applyItalianCoordinatesToLightPoint(lpToUpdate);
     if (coordErrors.length > 0) {
@@ -941,23 +974,31 @@ router.patch('/lightPoints/update/:_id', async (req, res) => {
     try {
         const updatedLP = await lightPoints.findOneAndUpdate(
             { _id: _id },
-            lpToUpdate,
+            { $set: lpToUpdate },
             { new: true }
         );
 
         if (!updatedLP) {
-            return res.status(404).send("Punto luce non trovato.");
+            return res.status(404).send('Punto luce non trovato.');
         }
 
         res.send(updatedLP);
     } catch (error) {
-        res.status(500).send("Errore del server: " + error.message);
+        res.status(500).send('Errore del server: ' + error.message);
     }
 });
 
 router.get('/', async (req, res) => {
     try {
-        const thList = await townHalls.find({}).sort({ name: 1 }).collation({ locale: 'it', strength: 2 });;
+        const user = await loadRequestUser(req);
+        if (!user) {
+            return res.status(401).json({ error: 'Utente non autenticato' });
+        }
+
+        const filter = isSuperAdmin(user)
+            ? {}
+            : { _id: { $in: user.town_halls_list || [] } };
+        const thList = await townHalls.find(filter).sort({ name: 1 }).collation({ locale: 'it', strength: 2 });
 
         const transformedList = thList.map(th => {
             const thObject = th.toObject(); // Converte il documento Mongoose in un oggetto JavaScript
@@ -979,6 +1020,8 @@ router.get('/', async (req, res) => {
 
 router.get('/:name', async (req, res) => {
     try {
+        if (!(await requireTownHallAccessByName(req, res, req.params.name))) return;
+
         const th = await townHalls.findOne({ name: req.params.name })
             .populate({
                 path: 'punti_luce',
@@ -1000,6 +1043,8 @@ router.get('/:name', async (req, res) => {
 /** Meta leggero: totale punti + centro senza populate */
 router.get('/:name/meta', async (req, res) => {
     try {
+        if (!(await requireTownHallAccessByName(req, res, req.params.name))) return;
+
         const th = await townHalls.findOne({ name: req.params.name })
             .select('name punti_luce coordinates');
         if (!th) {
@@ -1047,6 +1092,8 @@ router.get('/:name/meta', async (req, res) => {
  */
 router.get('/:name/lightPoints', async (req, res) => {
     try {
+        if (!(await requireTownHallAccessByName(req, res, req.params.name))) return;
+
         const { offset, limit } = parsePagination(req.query, 500);
         const th = await townHalls.findOne({ name: req.params.name }).select('name punti_luce');
         if (!th) {
@@ -1092,6 +1139,8 @@ router.get('/:name/lightPoints', async (req, res) => {
 router.get('/lightpoints/getActiveReports', async (req, res) => {
     try {
         const { name, numero_palo } = req.query;
+        if (!(await requireTownHallAccessByName(req, res, name))) return;
+
         const townHall = await townHalls.findOne({ name })
             .populate({
                 path: 'punti_luce',
@@ -1127,8 +1176,9 @@ router.get('/lightpoints/getPoint/', async (req, res) => {
         if (!name || !numero_palo) {
             return res.status(400).send('Nome del comune e numero del palo sono richiesti.');
         }
+        if (!(await requireTownHallAccessByName(req, res, name))) return;
 
-        const townHall = await townHalls.findOne({ $eq: name }).populate({
+        const townHall = await townHalls.findOne({ name: { $eq: name } }).populate({
             path: 'punti_luce',
             match: { numero_palo: numero_palo },
         });
@@ -1153,6 +1203,7 @@ router.get('/lightpoints/getPointGeoJSON/', async (req, res) => {
         if (!name || !numero_palo) {
             return res.status(400).send('Nome del comune e numero del palo sono richiesti.');
         }
+        if (!(await requireTownHallAccessByName(req, res, name))) return;
 
         const townHall = await townHalls.findOne({ name: name }).populate({
             path: 'punti_luce',
@@ -1191,6 +1242,8 @@ router.get('/lightpoints/getPointGeoJSON/', async (req, res) => {
 
 router.get('/:name/geojson', async (req, res) => {
     try {
+        if (!(await requireTownHallAccessByName(req, res, req.params.name))) return;
+
         const th = await townHalls.findOne({ name: req.params.name }).select('name punti_luce');
         if (!th || !th.punti_luce || th.punti_luce.length === 0) {
             return res.status(404).send('Comune o punti luce non trovati');
@@ -1338,6 +1391,7 @@ router.post('/lightPoints/viewport', async (req, res) => {
         if (!city || isNaN(north) || isNaN(south) || isNaN(east) || isNaN(west)) {
             return res.status(400).json({ error: 'Parametri mancanti o non validi' });
         }
+        if (!(await requireTownHallAccessByName(req, res, city))) return;
 
         // Trova il comune
         const townHall = await townHalls.findOne({ name: city }).select('punti_luce');
@@ -1394,6 +1448,7 @@ router.post('/lightPoints/clusters', async (req, res) => {
         if (!city || north === undefined || south === undefined || east === undefined || west === undefined || isNaN(zoom)) {
             return res.status(400).json({ error: 'Parametri mancanti o non validi' });
         }
+        if (!(await requireTownHallAccessByName(req, res, city))) return;
 
         // Trova il comune
         const townHall = await townHalls.findOne({ name: city }).select('punti_luce');
@@ -1481,18 +1536,19 @@ router.post('/lightPoints/clusters', async (req, res) => {
 // Restituisce: { "ComuneA": 1200, ... } solo per i comuni dell'utente se userId è fornito
 router.get('/lightPoints/counts', async (req, res) => {
     try {
-        const userId = req.query.userId;
+        const currentUser = await loadRequestUser(req);
+        if (!currentUser) {
+            return res.status(401).json({ error: 'Utente non autenticato' });
+        }
+
+        // Ignora userId arbitrario in query: conta solo i comuni accessibili all'utente autenticato
         let thList;
-        if (userId) {
-            // Recupera l'utente e la sua lista di comuni
-            const user = await users.findById(userId).select('town_halls_list');
-            if (!user || !user.town_halls_list || user.town_halls_list.length === 0) {
-                return res.json({});
-            }
-            thList = await townHalls.find({ _id: { $in: user.town_halls_list } }).select('name punti_luce');
-        } else {
-            // Nessun filtro utente, restituisci tutti i comuni
+        if (isSuperAdmin(currentUser)) {
             thList = await townHalls.find({}).select('name punti_luce');
+        } else if (!currentUser.town_halls_list || currentUser.town_halls_list.length === 0) {
+            return res.json({});
+        } else {
+            thList = await townHalls.find({ _id: { $in: currentUser.town_halls_list } }).select('name punti_luce');
         }
         const result = {};
         thList.forEach(th => {

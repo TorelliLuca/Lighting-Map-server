@@ -11,6 +11,10 @@ const FAULT_LABEL_TO_REPORT_TYPE = {
     MULTIPLE_OFF: 'LIGHT_POINT_OFF',
     SINGLE_OFF: 'LIGHT_POINT_OFF',
     NON_URGENT: 'OTHER',
+    PANEL_DAMAGE: 'BROKEN_PANEL',
+    PANEL_DOOR_UNSAFE: 'BROKEN_PANEL',
+    PANEL_PROTECTION_TRIP: 'PLANT_OFF',
+    PANEL_SUPPLY_FAULT: 'PLANT_OFF',
 };
 
 const FAULT_LABEL_LABELS = {
@@ -19,6 +23,10 @@ const FAULT_LABEL_LABELS = {
     MULTIPLE_OFF: 'Tre o più punti luce spenti nello stesso tratto',
     SINGLE_OFF: 'Punto luce singolo spento',
     NON_URGENT: 'Anomalia non urgente',
+    PANEL_DAMAGE: 'Quadro elettrico danneggiato',
+    PANEL_DOOR_UNSAFE: 'Sportello aperto / quadro non sicuro',
+    PANEL_PROTECTION_TRIP: 'Protezioni intervenute / interruttore scattato',
+    PANEL_SUPPLY_FAULT: 'Anomalia alimentazione quadro',
 };
 
 function mapFaultLabelToReportType(faultLabel, fallback = 'LIGHT_POINT_OFF') {
@@ -141,6 +149,33 @@ function transitionReportStatus(report, status, userId, note = '') {
     appendStatusHistory(report, { status, by: userId, note });
 }
 
+/**
+ * Valida che fault_label sia applicabile al marker del punto (PL/QE).
+ * Se la config non è disponibile o la voce non è in elenco, non blocca.
+ */
+async function assertFaultLabelForMarker({ townHallId, faultLabel, marker }) {
+    if (!faultLabel || !marker) return { ok: true };
+    const { findActiveConfig } = require('./maintenanceConfigHelpers');
+    const {
+        normalizeFaultLabelsList,
+        isFaultLabelApplicableToMarker,
+    } = require('./maintenanceConfigDefaults');
+
+    const config = await findActiveConfig(townHallId);
+    if (!config?.faultLabels?.length) return { ok: true };
+
+    const labels = normalizeFaultLabelsList(config.faultLabels);
+    const match = labels.find((item) => item.code === faultLabel);
+    if (!match) return { ok: true };
+    if (isFaultLabelApplicableToMarker(match, marker)) return { ok: true };
+
+    const markerLabel = String(marker).toUpperCase() === 'QE' ? 'quadro elettrico' : 'punto luce';
+    return {
+        ok: false,
+        error: `La voce di guasto "${match.label || faultLabel}" non è applicabile a un ${markerLabel}`,
+    };
+}
+
 module.exports = {
     FAULT_LABEL_TO_REPORT_TYPE,
     FAULT_LABEL_LABELS,
@@ -149,4 +184,5 @@ module.exports = {
     resolvePlantContext,
     notifyReportCreated,
     transitionReportStatus,
+    assertFaultLabelForMarker,
 };

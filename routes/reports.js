@@ -7,11 +7,12 @@ const users = require('../schemas/users');
 const quotes = require('../schemas/quotes');
 const { getAllPuntiLuce } = require('../utils/lightPointHelpers');
 const logAccess = require('../utils/accessLogger');
-const { STAFF_ROLES, requireRole, requireTownHallAccess, loadRequestUser } = require('../utils/roles');
+const { STAFF_ROLES, requireRole, requireTownHallAccess, requireTownHallAccessByName, loadRequestUser } = require('../utils/roles');
 const {
     resolvePlantContext,
     notifyReportCreated,
     transitionReportStatus,
+    assertFaultLabelForMarker,
 } = require('../utils/reportHelpers');
 const { appendStatusHistory } = require('../utils/statusHistory');
 const router = express.Router();
@@ -20,12 +21,15 @@ const ADMIN_ROLES = new Set(['ADMINISTRATOR', 'SUPER_ADMIN']);
 
 router.post('/addReport', async (req, res) => {
     try {
-        const th = await townHalls.findOne({ name: { $eq: req.body.name } });
-        if (!th) {
+        const th = await requireTownHallAccessByName(req, res, req.body.name);
+        if (!th) return;
+
+        const townHall = await townHalls.findById(th._id);
+        if (!townHall) {
             return res.status(404).send('Comune non trovato');
         }
 
-        const puntiLuce = await getAllPuntiLuce(th.punti_luce);
+        const puntiLuce = await getAllPuntiLuce(townHall.punti_luce);
         const puntoLuce = puntiLuce.find((punto) => punto && punto.numero_palo === req.body.numero_palo);
 
         if (!puntoLuce) {
@@ -43,7 +47,18 @@ router.post('/addReport', async (req, res) => {
         // altrimenti resta il valore legacy inviato dal client.
         const reportType = faultLabel || req.body.report_type || 'LIGHT_POINT_OFF';
 
-        const plantContext = await resolvePlantContext(puntoLuce, th);
+        if (faultLabel) {
+            const check = await assertFaultLabelForMarker({
+                townHallId: townHall._id,
+                faultLabel,
+                marker: puntoLuce.marker,
+            });
+            if (!check.ok) {
+                return res.status(400).json({ error: check.error });
+            }
+        }
+
+        const plantContext = await resolvePlantContext(puntoLuce, townHall);
 
         const reportPayload = {
             operation_point_id: puntoLuce._id,
@@ -55,7 +70,7 @@ router.post('/addReport', async (req, res) => {
             fault_label: faultLabel,
             risk_class: riskClass,
             plant_context: plantContext,
-            town_hall_id: th._id,
+            town_hall_id: townHall._id,
         };
 
         if (isAdminReport && faultLabel && riskClass) {
@@ -139,7 +154,14 @@ router.get('/api/reports/active', requireRole(...STAFF_ROLES), async (req, res) 
             .populate({
                 path: 'segnalazioni_in_corso',
                 model: 'reports',
-                populate: { path: 'user_creator_id', select: 'name surname email' },
+                populate: [
+                    { path: 'user_creator_id', select: 'name surname email' },
+                    {
+                        path: 'linked_quote_id',
+                        model: 'quotes',
+                        select: 'protocolNumber status type total dueDate',
+                    },
+                ],
             });
 
         const results = [];
@@ -266,7 +288,8 @@ router.get('/api/reports/extraordinary', requireRole(...STAFF_ROLES), async (req
     }
 });
 
-// GET /api/reports/resolved-for-quote — segnalazioni risolte collegabili a un nuovo preventivo
+// GET /api/reports/resolved-for-quote — segnalazioni aperte che richiedono preventivo IMS,
+// senza preventivo già associato (esito sopralluogo REQUIRES_QUOTE / PENDING_QUOTE).
 router.get('/api/reports/resolved-for-quote', requireRole(...STAFF_ROLES), async (req, res) => {
     try {
         const { townHallName } = req.query;
@@ -281,40 +304,60 @@ router.get('/api/reports/resolved-for-quote', requireRole(...STAFF_ROLES), async
         if (!(await requireTownHallAccess(req, res, th._id))) return;
 
         const quotesModel = quotes;
+        const ACTIVE_QUOTE_STATUSES = ['DRAFT', 'PENDING_APPROVAL', 'NEEDS_REVISION', 'APPROVED', 'REJECTED'];
         const puntiLuce = await light_points.find({ _id: { $in: th.punti_luce } })
-            .select('numero_palo marker indirizzo lat lng segnalazioni_risolte')
+            .select('numero_palo marker indirizzo lat lng segnalazioni_in_corso')
             .populate({
-                path: 'segnalazioni_risolte',
+                path: 'segnalazioni_in_corso',
                 model: 'reports',
+                match: {
+                    is_solved: { $ne: true },
+                    workflow_status: 'PENDING_QUOTE',
+                },
                 options: { sort: { report_date: -1 } },
             });
 
-        const results = [];
+        const candidates = [];
         for (const pl of puntiLuce) {
-            for (const report of pl.segnalazioni_risolte || []) {
-                if (!report || !report.is_solved) continue;
-
-                const activeQuote = await quotesModel.findOne({
-                    reportId: report._id,
-                    type: 'QUOTE',
-                    status: { $in: ['DRAFT', 'PENDING_APPROVAL', 'APPROVED'] },
-                }).select('_id status');
-
-                results.push({
-                    report,
-                    lightPoint: {
-                        _id: pl._id,
-                        numero_palo: pl.numero_palo,
-                        marker: pl.marker,
-                        indirizzo: pl.indirizzo,
-                        lat: pl.lat,
-                        lng: pl.lng,
-                    },
-                    hasActiveQuote: Boolean(activeQuote),
-                    activeQuoteId: activeQuote?._id || null,
-                    activeQuoteStatus: activeQuote?.status || null,
-                });
+            for (const report of pl.segnalazioni_in_corso || []) {
+                if (!report || report.is_solved) continue;
+                if (report.workflow_status !== 'PENDING_QUOTE') continue;
+                candidates.push({ pl, report });
             }
+        }
+
+        const reportIds = candidates.map(({ report }) => report._id);
+        const existingQuotes = reportIds.length
+            ? await quotesModel.find({
+                reportId: { $in: reportIds },
+                type: 'QUOTE',
+                status: { $in: ACTIVE_QUOTE_STATUSES },
+            }).select('_id status reportId')
+            : [];
+        const quoteByReportId = new Map(
+            existingQuotes.map((q) => [String(q.reportId), q])
+        );
+
+        const results = [];
+        for (const { pl, report } of candidates) {
+            if (report.linked_quote_id) continue;
+            const activeQuote = quoteByReportId.get(String(report._id));
+            if (activeQuote) continue;
+
+            results.push({
+                report,
+                lightPoint: {
+                    _id: pl._id,
+                    numero_palo: pl.numero_palo,
+                    marker: pl.marker,
+                    indirizzo: pl.indirizzo,
+                    lat: pl.lat,
+                    lng: pl.lng,
+                },
+                hasActiveQuote: false,
+                activeQuoteId: null,
+                activeQuoteStatus: null,
+            });
         }
 
         results.sort((a, b) => {
@@ -338,6 +381,9 @@ router.get('/api/reports/:id', requireRole(...STAFF_ROLES), async (req, res) => 
         if (!report) {
             return res.status(404).json({ error: 'Segnalazione non trovata' });
         }
+        if (report.town_hall_id) {
+            if (!(await requireTownHallAccess(req, res, report.town_hall_id))) return;
+        }
         return res.json(report);
     } catch (error) {
         console.error('Errore GET report:', error);
@@ -351,6 +397,9 @@ router.patch('/api/reports/:id/classification', requireRole('MAINTAINER', 'SUPER
         const report = await reports.findById(req.params.id);
         if (!report || report.is_solved) {
             return res.status(404).json({ error: 'Segnalazione non trovata o già chiusa' });
+        }
+        if (report.town_hall_id) {
+            if (!(await requireTownHallAccess(req, res, report.town_hall_id))) return;
         }
 
         const userId = req.currentUser?._id || req.user?.id;

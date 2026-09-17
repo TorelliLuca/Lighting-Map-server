@@ -1,5 +1,8 @@
 const MaintenanceConfig = require('../schemas/maintenanceConfig');
-const { cloneDefaults } = require('./maintenanceConfigDefaults');
+const {
+    cloneDefaults,
+    normalizeFaultLabelsList,
+} = require('./maintenanceConfigDefaults');
 
 const EXPIRING_SOON_DAYS = 30;
 
@@ -8,6 +11,7 @@ let legacyMigrationPromise = null;
 /**
  * One-shot: legacy docs without status become active.
  * Also drops the old unique-only index on townHallId if present.
+ * Backfill applicableTo + voci quadro mancanti su faultLabels.
  */
 async function ensureLegacyMigration() {
     if (legacyMigrationPromise) return legacyMigrationPromise;
@@ -33,6 +37,21 @@ async function ensureLegacyMigration() {
             }
 
             await MaintenanceConfig.syncIndexes();
+
+            const configs = await MaintenanceConfig.find({}).select('faultLabels');
+            for (const config of configs) {
+                const current = Array.isArray(config.faultLabels) ? config.faultLabels : [];
+                const needsApplicableTo = current.some(
+                    (item) => !Array.isArray(item.applicableTo) || item.applicableTo.length === 0
+                );
+                const codes = new Set(current.map((item) => item.code));
+                const { DEFAULT_FAULT_LABELS } = require('./maintenanceConfigDefaults');
+                const missingDefaults = DEFAULT_FAULT_LABELS.some((item) => !codes.has(item.code));
+                if (!needsApplicableTo && !missingDefaults) continue;
+                config.faultLabels = normalizeFaultLabelsList(current);
+                config.markModified('faultLabels');
+                await config.save();
+            }
         } catch (error) {
             console.error('Migrazione maintenanceConfig legacy fallita:', error);
             legacyMigrationPromise = null;
@@ -137,9 +156,11 @@ function cloneConfigFields(source) {
         riskClasses: (source.riskClasses || []).map((item) => (
             typeof item.toObject === 'function' ? item.toObject() : { ...item }
         )),
-        faultLabels: (source.faultLabels || []).map((item) => (
-            typeof item.toObject === 'function' ? item.toObject() : { ...item }
-        )),
+        faultLabels: normalizeFaultLabelsList(
+            (source.faultLabels || []).map((item) => (
+                typeof item.toObject === 'function' ? item.toObject() : { ...item }
+            ))
+        ),
         materialCatalog: (source.materialCatalog || [])
             .filter((item) => (item.priceType || 'capitolato') !== 'regional')
             .map((item) => (
@@ -404,9 +425,17 @@ function normalizeBomList(bom = []) {
 
 /** Solo voci locali (user/capitolato) da persistere sul config. */
 function stripRegionalFromCatalog(catalog) {
+    const { normalizeUdm } = require('./udm');
     return (catalog || [])
         .filter((item) => (item.priceType || 'capitolato') !== 'regional')
-        .map(toPlainMaterial);
+        .map((item) => {
+            const plain = toPlainMaterial(item);
+            return {
+                ...plain,
+                udm: normalizeUdm(plain.udm),
+                bom: normalizeBomList(plain.bom),
+            };
+        });
 }
 
 /**
@@ -436,6 +465,7 @@ async function enrichConfigDocument(config) {
     const RegionalPriceList = require('../schemas/regionalPriceList');
     const Organizations = require('../schemas/organizations');
     const plain = typeof config.toObject === 'function' ? config.toObject() : { ...config };
+    plain.faultLabels = normalizeFaultLabelsList(plain.faultLabels);
 
     let regionalList = null;
     if (plain.regionalPriceListId) {

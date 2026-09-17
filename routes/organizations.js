@@ -10,12 +10,49 @@ const {
     buildValidityMeta,
     enrichConfigDocument,
 } = require('../utils/maintenanceConfigHelpers');
+const {
+    requireRole,
+    requireTownHallAccess,
+    loadRequestUser,
+    isSuperAdmin,
+} = require('../utils/roles');
 const router = express.Router();
+
+const requireSuperAdmin = requireRole('SUPER_ADMIN');
+
+const USER_SAFE_SELECT =
+    '-password -resetPasswordToken -resetPasswordExpires -emailConfirmToken -emailConfirmExpires -passwordChangedAt';
+
+const populateMembersSafe = { path: 'members', select: USER_SAFE_SELECT };
+const populateResponsibleSafe = { path: 'responsible', select: USER_SAFE_SELECT };
+
+async function canAccessOrganization(user, organizationId) {
+    if (!user || !organizationId) return false;
+    if (isSuperAdmin(user)) return true;
+    const fullUser = await users.findById(user._id).select('id_organization').lean();
+    if (fullUser?.id_organization && String(fullUser.id_organization) === String(organizationId)) {
+        return true;
+    }
+    const asMember = await organizations.exists({ _id: organizationId, members: user._id });
+    return Boolean(asMember);
+}
 
 router.get('/my-organization/:organizationId', async (req, res) => {
     try {
+        const user = await loadRequestUser(req);
+        if (!user) {
+            return res.status(401).json({ error: 'Utente non autenticato' });
+        }
+
         const organizationId = req.params.organizationId;
-        const organization = await organizations.findById(organizationId).populate('members').populate('responsible');
+        if (!(await canAccessOrganization(user, organizationId))) {
+            return res.status(403).json({ error: 'Accesso negato a questa organizzazione' });
+        }
+
+        const organization = await organizations
+            .findById(organizationId)
+            .populate(populateMembersSafe)
+            .populate(populateResponsibleSafe);
         if (!organization) return res.status(404).send('Organizzazione non trovata');
         res.status(200).json(organization);
     } catch (err) {
@@ -24,7 +61,7 @@ router.get('/my-organization/:organizationId', async (req, res) => {
     }
 });
 
-router.get('/all-organizations', async (req, res) => {
+router.get('/all-organizations', requireSuperAdmin, async (req, res) => {
     try {
         const organizationsList = await organizations.find();
         res.status(200).json(organizationsList);
@@ -55,6 +92,8 @@ router.get('/townhall/:townhallId', async (req, res) => {
             return res.status(400).json({ error: "L'ID o il nome del comune fornito non è valido." });
         }
 
+        if (!(await requireTownHallAccess(req, res, townHallOid))) return;
+
         const activeConfig = await findActiveConfig(townHallOid);
         const validity = activeConfig ? buildValidityMeta(activeConfig) : null;
         const linked = Array.isArray(activeConfig?.linkedOrganizations)
@@ -67,8 +106,8 @@ router.get('/townhall/:townhallId', async (req, res) => {
         if (linked.length > 0) {
             const orgIds = linked.map((item) => item.organizationId).filter(Boolean);
             orgDocs = await organizations.find({ _id: { $in: orgIds } })
-                .populate('members')
-                .populate('responsible')
+                .populate(populateMembersSafe)
+                .populate(populateResponsibleSafe)
                 .lean();
             for (const item of linked) {
                 bindingByOrgId.set(String(item.organizationId), {
@@ -78,7 +117,6 @@ router.get('/townhall/:townhallId', async (req, res) => {
                 });
             }
         } else {
-            // Legacy: contratti org↔comune o maintainers sul comune
             const townHall = await townHalls.findById(townHallOid)
                 .select('organizations_maintainers')
                 .lean();
@@ -88,8 +126,8 @@ router.get('/townhall/:townhallId', async (req, res) => {
                 type: 'ENTERPRISE',
                 'contracts.townhall_associated': townHallOid,
             })
-                .populate('members')
-                .populate('responsible')
+                .populate(populateMembersSafe)
+                .populate(populateResponsibleSafe)
                 .lean();
 
             const byMaintainer = maintainerIds.length > 0
@@ -97,8 +135,8 @@ router.get('/townhall/:townhallId', async (req, res) => {
                     _id: { $in: maintainerIds },
                     type: 'ENTERPRISE',
                 })
-                    .populate('members')
-                    .populate('responsible')
+                    .populate(populateMembersSafe)
+                    .populate(populateResponsibleSafe)
                     .lean()
                 : [];
 
@@ -158,7 +196,6 @@ router.get('/townhall/:townhallId', async (req, res) => {
                 budgetOrdinary: binding.budgetOrdinary,
                 budgetExtraordinary: binding.budgetExtraordinary,
                 bindingNotes: binding.notes,
-                // Compatibilità UI legacy: non più fonte di verità
                 contracts: [],
             };
         });
@@ -174,7 +211,7 @@ router.get('/townhall/:townhallId', async (req, res) => {
     }
 });
 
-router.post('/add-organization', async (req, res) => {
+router.post('/add-organization', requireSuperAdmin, async (req, res) => {
     try {
         const { name, description, type, logo, location, address, townhall_id } = req.body;
         const newOrganization = new organizations({
@@ -201,7 +238,7 @@ router.post('/add-organization', async (req, res) => {
     }
 });
 
-router.put('/add-users-to-organization', async (req, res) => {
+router.put('/add-users-to-organization', requireSuperAdmin, async (req, res) => {
     try {
         const { members, organizationId } = req.body;
 
@@ -231,7 +268,7 @@ router.put('/add-users-to-organization', async (req, res) => {
     }
 });
 
-router.put('/remove-user-from-organization', async (req, res) => {
+router.put('/remove-user-from-organization', requireSuperAdmin, async (req, res) => {
     const userId = req.body.userId;
     const organizationId = req.body.organizationId;
     try {
@@ -247,7 +284,7 @@ router.put('/remove-user-from-organization', async (req, res) => {
             userId,
             { $unset: { id_organization: '' } },
             { new: true }
-        );
+        ).select(USER_SAFE_SELECT);
         if (!updatedUser) {
             return res.status(404).send('Utente non trovato');
         }
@@ -262,7 +299,7 @@ router.put('/remove-user-from-organization', async (req, res) => {
  * @deprecated Preferire ParametriCapitolato → linkedOrganizations.
  * Compatibilità: collega l'org al capitolato attivo del comune con budget O/S.
  */
-router.put('/add-contract-to-organization', async (req, res) => {
+router.put('/add-contract-to-organization', requireSuperAdmin, async (req, res) => {
     const { organizationId, contract, budgetOrdinary, budgetExtraordinary } = req.body;
     try {
         const organization = await organizations.findById(organizationId);
@@ -327,7 +364,7 @@ router.put('/add-contract-to-organization', async (req, res) => {
     }
 });
 
-router.put('/associate-townhall-to-organization', async (req, res) => {
+router.put('/associate-townhall-to-organization', requireSuperAdmin, async (req, res) => {
     const { organizationId, townhallId } = req.body;
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -475,7 +512,7 @@ function validateOrganizationPatch(body) {
     return { errors, updates };
 }
 
-router.patch('/:id', async (req, res) => {
+router.patch('/:id', requireSuperAdmin, async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
 
@@ -591,7 +628,7 @@ async function purgeOrganizationFromCapitolati(organizationId, session) {
     );
 }
 
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', requireSuperAdmin, async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
 
@@ -630,7 +667,7 @@ router.delete('/:id', async (req, res) => {
     }
 });
 
-router.delete('/:id/with-users', async (req, res) => {
+router.delete('/:id/with-users', requireSuperAdmin, async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
 

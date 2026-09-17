@@ -17,8 +17,12 @@ const schema = new Schema({
     town_halls_list: [{type: Schema.Types.ObjectId, ref: 'townHalls'}],
     is_approved: {type: Boolean, default: false},
     emailVerified: {type: Boolean, default: false},
+    emailConfirmToken: {type: String, default: null},
+    emailConfirmExpires: {type: Date, default: null},
     resetPasswordToken: {type: String, default: null},
     resetPasswordExpires: {type: Date, default: null},
+    /** Usato per invalidare i JWT emessi prima di un cambio password */
+    passwordChangedAt: { type: Date, default: null },
     id_organization: {type: Schema.Types.ObjectId, ref: 'organizations', default: null},
     requested_townhall: {type: String, default: null},
     requested_townhall_notes: {type: String, default: null},
@@ -31,16 +35,19 @@ const schema = new Schema({
 })
 
 schema.pre('save', async function(next) {
-    if (this.isModified('password') || this.isNew) {
-        try {
-            const salt = await bcrypt.genSalt(10);
-            this.password = await bcrypt.hash(this.password, salt);
-            next();
-        } catch (err) {
-            next(err);
-        }
-    } else {
+    if (!this.isModified('password') && !this.isNew) {
         return next();
+    }
+    try {
+        if (this.isModified('password') && !this.isNew) {
+            // -1s evita che un JWT emesso subito dopo il reset risulti già invalidato (confronto su iat in secondi)
+            this.passwordChangedAt = new Date(Date.now() - 1000);
+        }
+        const salt = await bcrypt.genSalt(10);
+        this.password = await bcrypt.hash(this.password, salt);
+        next();
+    } catch (err) {
+        next(err);
     }
 });
 

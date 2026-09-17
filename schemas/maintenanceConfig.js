@@ -14,6 +14,11 @@ const faultLabelSchema = new Schema({
     label: { type: String, required: true },
     urgencyOrder: { type: Number, default: 0 },
     suggestedRiskClass: { type: String, enum: ['A', 'B', 'C', 'D'], default: 'C' },
+    /** Marker a cui si applica la voce: PL (punto luce), QE (quadro). */
+    applicableTo: {
+        type: [{ type: String, enum: ['PL', 'QE'] }],
+        default: () => ['PL', 'QE'],
+    },
 }, { _id: false });
 
 const MATERIAL_PRICE_TYPES = ['regional', 'user', 'capitolato'];

@@ -1,29 +1,51 @@
 const express = require('express');
 const lightPoints = require('../schemas/lightPoints');
 const townHalls = require('../schemas/townHalls');
-const users = require('../schemas/users');
 const mongoose = require('mongoose');
 const {
     normalizeItalianCoordinate,
     applyItalianCoordinatesToLightPoint
 } = require('../utils/utility');
+const {
+    requireRole,
+    requireTownHallAccess,
+    canAccessTownHall,
+    loadRequestUser,
+} = require('../utils/roles');
 
 const router = express.Router();
 
 const BATCH_UPDATE_MAX = 500;
+
+const LP_UPDATE_BLOCKLIST = new Set([
+    '_id',
+    '__v',
+    'segnalazioni_in_corso',
+    'operazioni_effettuate',
+]);
+
+function sanitizeLightPointUpdate(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+    const cleaned = {};
+    for (const [key, value] of Object.entries(raw)) {
+        if (LP_UPDATE_BLOCKLIST.has(key)) continue;
+        cleaned[key] = value;
+    }
+    return cleaned;
+}
+
+async function findTownHallIdForLightPoint(lightPointId) {
+    const th = await townHalls.findOne({ punti_luce: lightPointId }).select('_id').lean();
+    return th?._id || null;
+}
 
 /**
  * Aggiorna lat/lng di più punti luce in un'unica richiesta (strumento lazo).
  * Body: { updates: [{ _id, lat, lng }, ...] }
  * Solo SUPER_ADMIN.
  */
-router.patch('/updateBatch', async (req, res) => {
+router.patch('/updateBatch', requireRole('SUPER_ADMIN'), async (req, res) => {
     try {
-        const requester = await users.findById(req.user.id).select('user_type');
-        if (!requester || requester.user_type !== 'SUPER_ADMIN') {
-            return res.status(403).json({ error: 'Accesso negato, non possiedi i diritti necessari!' });
-        }
-
         const { updates } = req.body || {};
         if (!Array.isArray(updates) || updates.length === 0) {
             return res.status(400).json({ error: 'Body non valido: richiesto updates (array non vuoto).' });
@@ -99,42 +121,46 @@ router.patch('/updateBatch', async (req, res) => {
     }
 });
 
-router.post('/update/:_id', async (req, res) => {
-    const type = req.body.user_type;
-    if(type !== "SUPER_ADMIN") {
-        return res.status(403).send("Accesso negato, non possiedi i diritti necessari!");
+router.post('/update/:_id', requireRole('SUPER_ADMIN', 'SURVEYOR'), async (req, res) => {
+    const _id = req.params._id;
+    const townHallId = await findTownHallIdForLightPoint(_id);
+    if (!townHallId) {
+        return res.status(404).send('Punto luce non trovato o non associato a un comune.');
     }
-    
-    const _id = req.params._id; 
-    const lpToUpdate = req.body.light_point;
+    if (!(await requireTownHallAccess(req, res, townHallId))) return;
+
+    const lpToUpdate = sanitizeLightPointUpdate(req.body.light_point);
     const coordErrors = applyItalianCoordinatesToLightPoint(lpToUpdate);
     if (coordErrors.length > 0) {
         return res.status(400).send('Coordinate non valide: ' + coordErrors.join('; '));
     }
     try {
         const updatedLP = await lightPoints.findOneAndUpdate(
-            { _id: _id }, 
-            lpToUpdate, 
-            { new: true } 
+            { _id: _id },
+            { $set: lpToUpdate },
+            { new: true }
         );
 
         if (!updatedLP) {
-            return res.status(404).send("Punto luce non trovato.");
+            return res.status(404).send('Punto luce non trovato.');
         }
 
-        res.send(updatedLP); 
+        res.send(updatedLP);
     } catch (error) {
-        res.status(500).send("Errore del server: " + error.message);
+        res.status(500).send('Errore del server: ' + error.message);
     }
 });
 
-router.post('/create', async (req, res) => {
-    const { light_point: lpToCreate, town_hall: townHallName, return_object: returnObject } = req.body;
-    
-    const townHall = await townHalls.findOne({name: townHallName});
-    if(!townHall) {
-        return res.status(404).send("Comune non trovato.");
+router.post('/create', requireRole('SUPER_ADMIN'), async (req, res) => {
+    const { light_point: lpRaw, town_hall: townHallName, return_object: returnObject } = req.body;
+
+    const townHall = await townHalls.findOne({ name: townHallName });
+    if (!townHall) {
+        return res.status(404).send('Comune non trovato.');
     }
+    if (!(await requireTownHallAccess(req, res, townHall._id))) return;
+
+    const lpToCreate = sanitizeLightPointUpdate(lpRaw);
 
     const normalizedNumeroPalo = String(lpToCreate?.numero_palo || '').trim();
     if (!normalizedNumeroPalo) {
@@ -167,7 +193,7 @@ router.post('/create', async (req, res) => {
 
     const session = await mongoose.startSession();
     session.startTransaction();
-    
+
     try {
         const newLP = new lightPoints(lpToCreate);
         await newLP.save({ session });
@@ -180,21 +206,32 @@ router.post('/create', async (req, res) => {
         if (returnObject === true) {
             return res.status(201).json(newLP);
         }
-        res.status(201).send("Punto luce creato con successo.");
+        res.status(201).send('Punto luce creato con successo.');
     } catch (error) {
         await session.abortTransaction();
-        res.status(500).send("Errore del server: " + error.message);
+        res.status(500).send('Errore del server: ' + error.message);
     } finally {
         session.endSession();
     }
 });
 
-router.delete('/delete/:_id',  async (req, res) => {
+router.delete('/delete/:_id', requireRole('SUPER_ADMIN', 'SURVEYOR'), async (req, res) => {
     const _id = req.params._id;
-    const lpToDelete = await lightPoints.findOne({_id: _id});
-    if(!lpToDelete) {
-        return res.status(404).send("Punto luce non trovato.");
+    const lpToDelete = await lightPoints.findOne({ _id: _id });
+    if (!lpToDelete) {
+        return res.status(404).send('Punto luce non trovato.');
     }
+
+    const townHall = await townHalls.findOne({ punti_luce: _id });
+    if (townHall) {
+        if (!(await requireTownHallAccess(req, res, townHall._id))) return;
+    } else {
+        const user = req.currentUser || await loadRequestUser(req);
+        if (!user || user.user_type !== 'SUPER_ADMIN') {
+            return res.status(403).json({ error: 'Accesso negato, non possiedi i diritti necessari!' });
+        }
+    }
+
     try {
         const childCount = await lightPoints.countDocuments({ parent: _id });
         if (childCount > 0) {
@@ -205,29 +242,38 @@ router.delete('/delete/:_id',  async (req, res) => {
             });
         }
 
-        const townHall = await townHalls.findOne({punti_luce: _id});
-        if(townHall) {
-            townHall.punti_luce = townHall.punti_luce.filter(id => id.toString() !== _id);
+        if (townHall) {
+            townHall.punti_luce = townHall.punti_luce.filter((id) => id.toString() !== _id);
             await townHall.save();
         }
-        await lightPoints.deleteOne({_id: _id});
-        res.status(200).send("Punto luce eliminato con successo.");
+        await lightPoints.deleteOne({ _id: _id });
+        res.status(200).send('Punto luce eliminato con successo.');
     } catch (error) {
-        res.status(500).send("Errore del server: " + error.message);
+        res.status(500).send('Errore del server: ' + error.message);
     }
-    
 });
 
 router.get('/:_id', async (req, res) => {
     const _id = req.params._id;
     try {
+        const user = await loadRequestUser(req);
+        if (!user) {
+            return res.status(401).json({ error: 'Utente non autenticato' });
+        }
+
         const lightPoint = await lightPoints.findById(_id);
         if (!lightPoint) {
-            return res.status(404).send("Punto luce non trovato.");
+            return res.status(404).send('Punto luce non trovato.');
         }
+
+        const townHallId = await findTownHallIdForLightPoint(_id);
+        if (!townHallId || !canAccessTownHall(user, townHallId)) {
+            return res.status(403).json({ error: 'Accesso negato, non possiedi i diritti necessari!' });
+        }
+
         res.json(lightPoint);
     } catch (error) {
-        res.status(500).send("Errore del server: " + error.message);
+        res.status(500).send('Errore del server: ' + error.message);
     }
 });
 

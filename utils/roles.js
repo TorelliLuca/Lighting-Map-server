@@ -1,7 +1,10 @@
 const users = require('../schemas/users');
+const townHalls = require('../schemas/townHalls');
 
 const STAFF_ROLES = ['ADMINISTRATOR', 'SUPER_ADMIN', 'MAINTAINER'];
 const CONFIG_EDITOR_ROLES = ['ADMINISTRATOR', 'SUPER_ADMIN'];
+const TOWN_HALL_ACCESS_DENIED_MESSAGE =
+    'Non sei autorizzato a visualizzare le informazioni di questo comune';
 
 async function loadRequestUser(req) {
     if (!req.user?.id) return null;
@@ -50,11 +53,30 @@ async function requireTownHallAccess(req, res, townHallId) {
         return null;
     }
     if (!canAccessTownHall(user, townHallId)) {
-        res.status(403).json({ error: 'Accesso negato al comune richiesto' });
+        res.status(403).json({ error: TOWN_HALL_ACCESS_DENIED_MESSAGE });
         return null;
     }
     req.currentUser = user;
     return user;
+}
+
+/**
+ * Risolve un comune per nome e verifica che l'utente autenticato possa accedervi.
+ * @returns {Promise<object|null>} documento townHall (minimo _id/name) oppure null se ha già risposto
+ */
+async function requireTownHallAccessByName(req, res, townHallName) {
+    const name = typeof townHallName === 'string' ? townHallName.trim() : '';
+    if (!name) {
+        res.status(400).json({ error: 'Nome comune obbligatorio' });
+        return null;
+    }
+    const th = await townHalls.findOne({ name: { $eq: name } }).select('_id name');
+    if (!th) {
+        res.status(404).json({ error: 'Comune non trovato' });
+        return null;
+    }
+    if (!(await requireTownHallAccess(req, res, th._id))) return null;
+    return th;
 }
 
 async function requireTownHallEdit(req, res, townHallId) {
@@ -74,11 +96,13 @@ async function requireTownHallEdit(req, res, townHallId) {
 module.exports = {
     STAFF_ROLES,
     CONFIG_EDITOR_ROLES,
+    TOWN_HALL_ACCESS_DENIED_MESSAGE,
     loadRequestUser,
     isSuperAdmin,
     canAccessTownHall,
     canEditMaintenanceConfig,
     requireRole,
     requireTownHallAccess,
+    requireTownHallAccessByName,
     requireTownHallEdit,
 };

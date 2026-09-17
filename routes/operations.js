@@ -9,13 +9,20 @@ const accessLogger = require('../middleware/accessLogger');
 const logAccess = require('../utils/accessLogger');
 const reports = require('../schemas/reports');
 const { transitionReportStatus } = require('../utils/reportHelpers');
-const { requireRole } = require('../utils/roles');
+const { requireRole, requireTownHallAccessByName } = require('../utils/roles');
 const router = express.Router();    
 
 router.post('/addOperation', requireRole('MAINTAINER', 'SUPER_ADMIN'), async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
     try {
+        const accessTh = await requireTownHallAccessByName(req, res, req.body.name);
+        if (!accessTh) {
+            await session.abortTransaction();
+            session.endSession();
+            return;
+        }
+
         const th = await townHalls.findOne({ name: {$eq: req.body.name} }).session(session);
 
         if (!th) {
@@ -188,12 +195,15 @@ router.get('/api/avg-time-report-operation/:comune', async (req, res) => {
         const comune = req.params.comune;
         if (!comune) return res.status(400).json({ error: 'Comune mancante' });
 
-        // 1. Trova il comune
-        const th = await townHalls.findOne({ name: { $eq: comune } });
-        if (!th) return res.status(404).json({ error: 'Comune non trovato' });
+        // 1. Trova il comune e verifica accesso
+        const th = await requireTownHallAccessByName(req, res, comune);
+        if (!th) return;
+
+        const townHall = await townHalls.findById(th._id);
+        if (!townHall) return res.status(404).json({ error: 'Comune non trovato' });
 
         // 2. Trova tutti i punti luce del comune
-        const ids = th.punti_luce;
+        const ids = townHall.punti_luce;
         if (!ids || ids.length === 0) return res.status(404).json({ error: 'Nessun punto luce trovato per questo comune' });
         const puntiLuce = await getAllPuntiLuce(ids);
 
