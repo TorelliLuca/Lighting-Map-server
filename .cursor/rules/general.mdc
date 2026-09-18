@@ -1,0 +1,24 @@
+---
+description: "Lighting-map-server - stack e struttura"
+alwaysApply: true
+---
+
+Backend Node.js/Express per Lighting-map (gestione punti luce comunali).
+CommonJS (require/module.exports), non ESM: non introdurre import/export
+a meno di migrare esplicitamente tutto il progetto.
+
+Struttura modulare, rispettala per ogni nuova funzionalità:
+- config/    → connessione DB e configurazione email
+- middleware/→ middleware trasversali (es. auth JWT)
+- routes/    → un file per dominio (auth, users, townHalls, lightPoints,
+               reports, operations, email, maps) — non mescolare domini
+               diversi nello stesso file di route
+- schemas/   → modelli Mongoose
+- utils/     → funzioni helper pure, senza side-effect su DB/rete
+- email/     → template email
+
+Stack: Express 4, Mongoose 8, JWT (jsonwebtoken) + bcrypt per l'auth,
+dotenv per le env var, cors, express-rate-limit su endpoint sensibili
+(es. login). Variabili d'ambiente richieste: JWT_SECRET, PASSWORD_DB,
+NAME_DB, PASSWORD_MAIL, GOOGLE_MAPS_APY_KEY, ADMIN_EMAIL, CORS_ORIGIN
+— non hardcodare mai questi valori, usa sempre process.env.

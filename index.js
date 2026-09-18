@@ -11,6 +11,8 @@ const connectDB = require('./config/database');
 
 // Import middleware
 const authenticateToken = require('./middleware/auth');
+const authenticateForRefresh = require('./middleware/refreshAuth');
+const { handleRefreshToken } = require('./utils/refreshTokenHandler');
 
 // Load environment variables
 const envFile = process.env.NODE_ENV === 'production' ? '.env.production' : '.env.development';
@@ -21,6 +23,7 @@ const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
 const townHallRoutes = require('./routes/townHalls');
 const lightPointRoutes = require('./routes/lightPoints');
+const topologyRoutes = require('./routes/topology');
 const reportRoutes = require('./routes/reports');
 const operationRoutes = require('./routes/operations');
 const emailRoutes = require('./routes/email');
@@ -30,6 +33,11 @@ const maintenanceRoutes = require('./routes/maintenance');
 const pushRoutes = require('./routes/push');
 const organizationsRoutes = require('./routes/organizations');
 const bordersRoutes = require('./routes/borders');
+const notificationsRoutes = require('./routes/notifications');
+const maintenanceConfigRoutes = require('./routes/maintenanceConfig');
+const regionalPriceListRoutes = require('./routes/regionalPriceLists');
+const inspectionsRoutes = require('./routes/inspections');
+const quotesRoutes = require('./routes/quotes');
 
 const app = express();
 
@@ -56,6 +64,7 @@ if (process.env.NODE_ENV === 'production') {
         ],
         methods: ['GET', 'POST', 'DELETE', 'PUT', 'OPTIONS', 'PATCH'],
         allowedHeaders: ['Authorization', 'Content-Type'],
+        exposedHeaders: ['Content-Disposition'],
         credentials: false
     };
 } else {
@@ -64,6 +73,7 @@ if (process.env.NODE_ENV === 'production') {
         origin: true,
         methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
         allowedHeaders: ['Authorization', 'Content-Type'],
+        exposedHeaders: ['Content-Disposition'],
         credentials: false
     };
 }
@@ -81,9 +91,19 @@ connectDB();
 // PUBLIC ROUTES (no authentication required)
 // =========================================
 
+// Immagini usate nei template email (devono essere raggiungibili dai client mail)
+const { ASSETS_DIR, PUBLIC_MOUNT, ensureAssetsDir } = require('./utils/emailAssets');
+ensureAssetsDir();
+app.use(PUBLIC_MOUNT, express.static(ASSETS_DIR, {
+    maxAge: '7d',
+    fallthrough: false,
+}));
+
 // Auth routes (login, registration, etc.)
 app.use('/', authRoutes);
-// Maintenance routes (cron job for cleaning up the database) 
+// Refresh token accetta JWT scaduti entro la finestra di grazia (prima del middleware auth)
+app.post('/users/refresh-token', authenticateForRefresh, handleRefreshToken);
+// Maintenance routes (cron job for cleaning up the database)
 // NOTE: protected by basic auth not jwt
 app.use('/api/maintenance', maintenanceRoutes);
 
@@ -100,6 +120,9 @@ app.use('/townHalls', townHallRoutes);
 
 // Light points routes
 app.use('/townHalls/lightPoints', lightPointRoutes);
+
+// Topology (electrical radial network) routes
+app.use('/topology', topologyRoutes);
 
 // Reports routes
 app.use('/', reportRoutes);
@@ -119,9 +142,26 @@ app.use('/api/access-logs', accessLogsRoutes);
 // Push notifications routes
 app.use('/api/push', pushRoutes);
 
+// In-app notifications
+app.use('/api/notifications', notificationsRoutes);
+
 app.use('/organizations', organizationsRoutes);
 
 app.use('/borders', bordersRoutes);
+
+// Maintenance capitolato / catalogo materiali per comune
+app.use('/api/maintenance-config', maintenanceConfigRoutes);
+app.use('/api/regional-price-lists', regionalPriceListRoutes);
+
+// Sopralluoghi manutenzione ordinaria
+app.use('/api/inspections', inspectionsRoutes);
+
+// Preventivi IMS
+app.use('/api/quotes', quotesRoutes);
+
+// Impostazioni email / newsletter (SUPER_ADMIN)
+const emailSettingsRoutes = require('./routes/emailSettings');
+app.use('/api/email-settings', emailSettingsRoutes);
 
 // Start server
 const PORT = process.env.PORT || 3000;

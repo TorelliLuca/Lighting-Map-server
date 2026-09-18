@@ -7,9 +7,52 @@ const users = require('../schemas/users');
 const XLSX = require('xlsx');
 const { transporter, emailLighting, debugMail } = require('../config/email');
 const { returnHtmlEmailUploadSuccess, returnHtmlEmailUploadError } = require('../utils/emailHelpers');
-const { toCsvItalianStyle, normalizeKeysToLowerCase, isEmptyLightPoint, compareNumeroPalo } = require('../utils/utility');
+const {
+    toCsvItalianStyle,
+    normalizeKeysToLowerCase,
+    isEmptyLightPoint,
+    compareNumeroPalo,
+    enrichLightPointsWithNumeroPaloParent,
+    resolveParentJobsFromNumeroPalo,
+    formatParentAmbiguitiesHtml,
+    toIdString,
+    applyItalianCoordinatesToLightPoint,
+    parseCoordValue
+} = require('../utils/utility');
+const {
+    normalizeLightPointData,
+    previewLightPointsImport
+} = require('../utils/lightPointCsv');
+const { createNotificationsForEmails, safeNotify } = require('../utils/notificationHelpers');
+const {
+    loadRequestUser,
+    isSuperAdmin,
+    requireRole,
+    requireTownHallAccess,
+    requireTownHallAccessByName,
+} = require('../utils/roles');
 
 const router = express.Router();
+
+const requireSuperAdmin = requireRole('SUPER_ADMIN');
+const requireLightPointEditor = requireRole('SUPER_ADMIN', 'SURVEYOR');
+
+const LP_UPDATE_BLOCKLIST = new Set([
+    '_id',
+    '__v',
+    'segnalazioni_in_corso',
+    'operazioni_effettuate',
+]);
+
+function sanitizeLightPointUpdate(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+    const cleaned = {};
+    for (const [key, value] of Object.entries(raw)) {
+        if (LP_UPDATE_BLOCKLIST.has(key)) continue;
+        cleaned[key] = value;
+    }
+    return cleaned;
+}
 
 function chunkArray(array, size) {
     const result = [];
@@ -19,8 +62,224 @@ function chunkArray(array, size) {
     return result;
 }
 
+function isValidObjectId(value) {
+    if (value == null || value === '') return false;
+    const s = String(value);
+    return mongoose.Types.ObjectId.isValid(s) && String(new mongoose.Types.ObjectId(s)) === s;
+}
 
-router.post('/', async (req, res) => {
+/**
+ * Separa i campi DB da numero_palo_parent (solo CSV) e normalizza parent.
+ * Se né parent né numero_palo_parent sono presenti nell'input, parent non viene toccato.
+ * @returns {{ doc: object, numero_palo_parent: string, hasValidParent: boolean, needsParentResolve: boolean }}
+ */
+function splitParentCsvFields(normalizedLp) {
+    const hasParentKey = Object.prototype.hasOwnProperty.call(normalizedLp || {}, 'parent');
+    const hasNppKey = Object.prototype.hasOwnProperty.call(normalizedLp || {}, 'numero_palo_parent');
+
+    const {
+        numero_palo_parent,
+        segnalazioni_in_corso,
+        segnalazioni_risolte,
+        operazioni_effettuate,
+        ...rest
+    } = normalizedLp || {};
+
+    const npp = hasNppKey && numero_palo_parent != null ? String(numero_palo_parent).trim() : '';
+    let hasValidParent = false;
+
+    if (hasParentKey) {
+        if (isValidObjectId(rest.parent)) {
+            rest.parent = new mongoose.Types.ObjectId(String(rest.parent));
+            hasValidParent = true;
+        } else {
+            rest.parent = null;
+        }
+    } else {
+        delete rest.parent;
+    }
+
+    return {
+        doc: rest,
+        numero_palo_parent: npp,
+        hasValidParent,
+        needsParentResolve: !hasValidParent && npp.length > 0
+    };
+}
+
+/**
+ * Dopo insert/update, risolve parent da numero_palo_parent e applica i $set.
+ */
+async function applyResolvedParents(jobs, candidates, session) {
+    const { resolved, ambiguities } = resolveParentJobsFromNumeroPalo(jobs, candidates);
+    if (resolved.length > 0) {
+        const ops = resolved.map(({ childId, parentId }) => ({
+            updateOne: {
+                filter: { _id: childId },
+                update: { $set: { parent: parentId } }
+            }
+        }));
+        const BATCH = 100;
+        for (let i = 0; i < ops.length; i += BATCH) {
+            await lightPoints.bulkWrite(ops.slice(i, i + BATCH), { session });
+        }
+    }
+    return ambiguities;
+}
+
+/** Invio email upload/update + notifica in-app allo stesso destinatario. */
+async function sendMailAndNotify(mailOptions, { type, townHallName, detail } = {}) {
+    const { sendConfiguredEmail } = require('../utils/mailEngine');
+    const emails = Array.isArray(mailOptions.to) ? mailOptions.to : [mailOptions.to];
+    const actionKey = type === 'UPLOAD_ERROR' ? 'UPLOAD_ERROR' : 'UPLOAD_SUCCESS';
+    const isError = actionKey === 'UPLOAD_ERROR';
+
+    await sendConfiguredEmail(actionKey, {
+        recipientEmails: emails.filter(Boolean),
+        vars: {
+            nome_comune: townHallName || '',
+            dettaglio: detail || mailOptions.subject || (isError
+                ? `Si è verificato un errore sul comune ${townHallName || ''}.`
+                : `Operazione completata sul comune ${townHallName || ''}.`),
+        },
+    });
+
+    await safeNotify(() =>
+        createNotificationsForEmails(mailOptions.to, {
+            title: mailOptions.subject || (isError ? 'Errore caricamento' : 'Caricamento completato'),
+            body: isError
+                ? `Si è verificato un errore sul comune ${townHallName || ''}.`
+                : `Operazione completata sul comune ${townHallName || ''}.`,
+            type: type || 'GENERIC',
+            meta: { townHallName: townHallName || null },
+        })
+    );
+}
+
+/** Populate nested usato da GET /:name e dalle pagine lightPoints */
+const LIGHT_POINT_FULL_POPULATE = [
+    {
+        path: 'segnalazioni_in_corso',
+        model: 'reports',
+        populate: [
+            {
+                path: 'user_creator_id',
+                model: 'users',
+                select: 'name surname email',
+            },
+            {
+                path: 'user_responsible_id',
+                model: 'users',
+                select: 'name surname email',
+            },
+            {
+                path: 'linked_quote_id',
+                model: 'quotes',
+                select: 'protocolNumber status type total dueDate',
+            },
+        ],
+    },
+    {
+        path: 'segnalazioni_risolte',
+        model: 'reports',
+        populate: [{
+            path: 'user_creator_id',
+            model: 'users',
+            select: 'name surname email'
+        }, {
+            path: 'user_responsible_id',
+            model: 'users',
+            select: 'name surname email'
+        }, {
+            path: 'linked_quote_id',
+            model: 'quotes',
+            select: 'protocolNumber status type total dueDate',
+        }]
+    },
+    {
+        path: 'operazioni_effettuate',
+        model: 'operations',
+        populate: [
+            {
+                path: 'operation_point_id',
+                model: 'lightPoints'
+            },
+            {
+                path: 'operation_responsible',
+                model: 'users',
+                select: 'name surname email'
+            },
+            {
+                path: 'report_to_solve',
+                model: 'reports'
+            }
+        ]
+    }
+];
+
+const GEOJSON_LIGHT_POINT_POPULATE = [
+    {
+        path: 'segnalazioni_in_corso',
+        model: 'reports',
+        populate: {
+            path: 'linked_quote_id',
+            model: 'quotes',
+            select: 'protocolNumber status type total dueDate',
+        },
+    },
+    { path: 'segnalazioni_risolte', model: 'reports' },
+    {
+        path: 'operazioni_effettuate',
+        model: 'operations',
+        populate: [
+            { path: 'operation_point_id', model: 'lightPoints' },
+            { path: 'operation_responsible', model: 'users', select: 'name surname email' },
+            { path: 'report_to_solve', model: 'reports' }
+        ]
+    }
+];
+
+function parsePagination(query, defaultLimit = 500) {
+    const offset = Math.max(0, parseInt(query.offset, 10) || 0);
+    let limit = parseInt(query.limit, 10);
+    if (isNaN(limit) || limit <= 0) limit = defaultLimit;
+    limit = Math.min(limit, 1000);
+    return { offset, limit };
+}
+
+function lightPointToGeoJsonFeature(pl) {
+    const props = pl.toObject ? pl.toObject() : pl;
+    const { lat, lng, ...rest } = props;
+    const latStr = lat == null ? '' : String(lat);
+    const lngStr = lng == null ? '' : String(lng);
+    return {
+        type: 'Feature',
+        geometry: {
+            type: 'Point',
+            coordinates: [
+                parseFloat(lngStr.replace(',', '.')),
+                parseFloat(latStr.replace(',', '.'))
+            ]
+        },
+        properties: rest
+    };
+}
+
+function formatCoordErrorsHtml(coordErrors) {
+    if (!Array.isArray(coordErrors) || coordErrors.length === 0) return '';
+    const items = coordErrors.map(e =>
+        `<li>Punto <b>${e.numero_palo || '—'}</b> (marker: ${e.marker || '—'}): ${e.reasons.join('; ')}</li>`
+    ).join('');
+    return `
+        <h3>Coordinate non valide</h3>
+        <p>Sono ammesse solo coordinate numeriche ben formattate (es. <code>45,123</code> o <code>45.123</code>).
+        Il punto come separatore decimale viene convertito in virgola.</p>
+        <ul>${items}</ul>
+    `;
+}
+
+
+router.post('/', requireSuperAdmin, async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
     let batchStatus = [];
@@ -41,6 +300,9 @@ router.post('/', async (req, res) => {
         }
 
         // Crea il comune senza punti luce
+        const bordersId = req.body.borders && String(req.body.borders).trim()
+            ? req.body.borders
+            : undefined;
         const th = await townHalls.create([{
             name: req.body.name,
             region: req.body.region,
@@ -49,51 +311,83 @@ router.post('/', async (req, res) => {
                 lat: req.body.coordinates?.lat,
                 lng: req.body.coordinates?.lng
             },
-            borders: req.body.borders
+            ...(bordersId ? { borders: bordersId } : {})
         }], { session });
 
         
 
         let puntiLuceIds = [];
         const BATCH_SIZE = 300;
+        let parentAmbiguities = [];
 
         if (req.body.light_points && Array.isArray(req.body.light_points) && req.body.light_points.length > 0) {
-            const lightPointsData = req.body.light_points.map(element => ({
-                marker: element.MARKER,
-                numero_palo: element.NUMERO_PALO,
-                composizione_punto: element.COMPOSIZIONE_PUNTO,
-                indirizzo: element.INDIRIZZO,
-                lotto: element.LOTTO,
-                quadro: element.QUADRO,
-                proprieta: element.PROPRIETA,
-                tipo_apparecchio: element.TIPO_APPARECCHIO,
-                modello: element.MODELLO_ARMATURA,
-                numero_apparecchi: element.NUMERO_APPARECCHI,
-                lampada_potenza: element.LAMPADA_E_POTENZA,
-                tipo_sostegno: element.TIPO_SOSTEGNO,
-                tipo_linea: element.TIPO_LINEA,
-                promiscuita: element.PROMISCUITA,
-                note: element.NOTE,
-                garanzia: element.GARANZIA,
-                lat: element.lat,
-                lng: element.lng,
-                pod: element.POD,
-                numero_contatore: element.NUMERO_CONTATORE,
-                alimentazione: element.ALIMENTAZIONE,
-                potenza_contratto: element.POTENZA_CONTRATTO,
-                potenza: element.POTENZA,
-                punti_luce: element.PUNTI_LUCE,
-                tipo: element.TIPO
+            const prepared = req.body.light_points
+                .map(element => splitParentCsvFields(normalizeLightPointData(element)))
+                .filter(({ doc }) => !isEmptyLightPoint(doc));
+
+            const coordErrors = [];
+            for (const p of prepared) {
+                const reasons = applyItalianCoordinatesToLightPoint(p.doc);
+                if (reasons.length > 0) {
+                    coordErrors.push({
+                        marker: p.doc.marker,
+                        numero_palo: p.doc.numero_palo,
+                        reasons
+                    });
+                }
+            }
+            if (coordErrors.length > 0) {
+                await session.abortTransaction();
+                session.endSession();
+                responseStatus = 400;
+                responseMessage = `Coordinate non valide in ${coordErrors.length} punti luce`;
+                mailSubject = 'Errore coordinate durante il caricamento';
+                mailHtml = formatCoordErrorsHtml(coordErrors);
+                res.status(responseStatus).send(responseMessage);
+                try {
+                    const adminEmails = req.body.userEmail;
+                    const mailOptions = {
+                        from: `LIGHTING MAP<${emailLighting}>`,
+                        to: adminEmails,
+                        subject: mailSubject,
+                        html: mailHtml
+                    };
+                    await sendMailAndNotify(mailOptions, {
+                        type: 'UPLOAD_ERROR',
+                        townHallName: req.body.name,
+                    });
+                } catch (e) {
+                    console.error('Errore nell\'invio email:', e);
+                }
+                return;
+            }
+
+            const lightPointsData = prepared.map(p => {
+                // In creazione: sempre nuovi ObjectId (evita CastError su _id vuoto e duplicate key da export)
+                delete p.doc._id;
+                // In creazione parent assente → null esplicito (default schema)
+                if (!Object.prototype.hasOwnProperty.call(p.doc, 'parent')) {
+                    p.doc.parent = null;
+                }
+                return p.doc;
+            });
+            const parentJobsMeta = prepared.map(p => ({
+                numero_palo_parent: p.numero_palo_parent,
+                needsParentResolve: p.needsParentResolve
             }));
 
             const batches = chunkArray(lightPointsData, BATCH_SIZE);
+            const allInserted = [];
+
             for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
                 const batch = batches[batchIndex];
                 try {
                     const inserted = await light_points.insertMany(batch, { session });
                     puntiLuceIds.push(...inserted.map(lp => lp._id));
+                    allInserted.push(...inserted);
                     batchStatus.push({ batch: batchIndex + 1, status: 'ok' });
                 } catch (batchErr) {
+                    console.error(`Errore insertMany batch ${batchIndex + 1}:`, batchErr);
                     let markerErrore = null;
                     if (batch && batch.length > 0) {
                         markerErrore = batch[0].marker;
@@ -119,7 +413,10 @@ router.post('/', async (req, res) => {
                     `;
 
                     isError = true;
-                    res.status(responseStatus).send(responseMessage);
+                    res.status(responseStatus).json({
+                        error: responseMessage,
+                        detail: batchErr?.message || String(batchErr)
+                    });
                     // Invia mail dopo la risposta
                     try {
                         const adminEmails = req.body.userEmail;
@@ -129,7 +426,10 @@ router.post('/', async (req, res) => {
                             subject: mailSubject,
                             html: mailHtml
                         };
-                        await transporter.sendMail(mailOptions);
+                        await sendMailAndNotify(mailOptions, {
+                            type: 'UPLOAD_ERROR',
+                            townHallName: req.body.name,
+                        });
                         debugMail(batchErr);
                     } catch (e) {
                         console.error('Errore nell\'invio email:', e);
@@ -137,14 +437,36 @@ router.post('/', async (req, res) => {
                     return;
                 }
             }
+
+            // Risolvi parent da numero_palo_parent (query inversa sul comune appena caricato)
+            const parentJobs = [];
+            for (let i = 0; i < allInserted.length; i++) {
+                const meta = parentJobsMeta[i];
+                if (!meta || !meta.needsParentResolve) continue;
+                parentJobs.push({
+                    childId: toIdString(allInserted[i]._id),
+                    childNumeroPalo: allInserted[i].numero_palo,
+                    childMarker: allInserted[i].marker,
+                    numero_palo_parent: meta.numero_palo_parent
+                });
+            }
+            if (parentJobs.length > 0) {
+                parentAmbiguities = await applyResolvedParents(parentJobs, allInserted, session);
+            }
+
             th[0].punti_luce = puntiLuceIds;
             await th[0].save({ session });
         }
 
         await session.commitTransaction();
         session.endSession();
-        mailHtml = returnHtmlEmailUploadSuccess(req.body.name, batchStatus);
-        res.status(responseStatus).send(responseMessage);
+        mailHtml = returnHtmlEmailUploadSuccess(req.body.name, batchStatus, parentAmbiguities);
+        res.status(responseStatus).json({
+            message: responseMessage,
+            _id: th[0]._id,
+            name: th[0].name,
+            light_points: puntiLuceIds.length
+        });
         // Invia mail dopo la risposta
         try {
             const adminEmails = req.body.userEmail;
@@ -154,19 +476,30 @@ router.post('/', async (req, res) => {
                 subject: mailSubject,
                 html: mailHtml
             };
-            await transporter.sendMail(mailOptions);
+            await sendMailAndNotify(mailOptions, {
+                type: 'UPLOAD_SUCCESS',
+                townHallName: req.body.name,
+            });
         } catch (e) {
             debugMail('Errore nell\'invio email di notifica:', e);
         }
     } catch (err) {
-        await session.abortTransaction();
-        session.endSession();
+        console.error('Errore creazione comune:', err);
+        try {
+            await session.abortTransaction();
+            session.endSession();
+        } catch (sessionErr) {
+            console.error('Errore chiusura sessione create:', sessionErr);
+        }
         responseStatus = 500;
         responseMessage = 'Errore durante il caricamento';
         mailSubject = 'Errore durante il caricamento';
         mailHtml = returnHtmlEmailUploadError(req.body.name, err?.message || '');
         isError = true;
-        res.status(responseStatus).send(responseMessage);
+        res.status(responseStatus).json({
+            error: responseMessage,
+            detail: err?.message || String(err)
+        });
         // Invia mail dopo la risposta
         try {
             const adminEmails = req.body.userEmail;
@@ -176,7 +509,10 @@ router.post('/', async (req, res) => {
                 subject: mailSubject,
                 html: mailHtml
             };
-            await transporter.sendMail(mailOptions);
+            await sendMailAndNotify(mailOptions, {
+                type: 'UPLOAD_ERROR',
+                townHallName: req.body.name,
+            });
             debugMail(err);
         } catch (e) {
             console.error('Errore nell\'invio email:', e);
@@ -184,7 +520,7 @@ router.post('/', async (req, res) => {
     }
 });
 
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', requireSuperAdmin, async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
     try {
@@ -248,7 +584,7 @@ function prepareBulkOps(incomingPoints) {
 }
 
 // Funzione per generare l'HTML della mail di successo con riepilogo quantità
-function returnHtmlEmailUpdateSuccessSummary(nomeComune, eliminati, modificati, aggiunti) {
+function returnHtmlEmailUpdateSuccessSummary(nomeComune, eliminati, modificati, aggiunti, parentAmbiguities = []) {
     return `
         <h2>Aggiornamento punti luce per il comune di <b>${nomeComune}</b> completato con successo!</h2>
         <ul>
@@ -256,55 +592,46 @@ function returnHtmlEmailUpdateSuccessSummary(nomeComune, eliminati, modificati, 
             <li><b>Modificati</b>: ${modificati.length}</li>
             <li><b>Aggiunti</b>: ${aggiunti.length}</li>
         </ul>
+        ${formatParentAmbiguitiesHtml(parentAmbiguities)}
         <p>In allegato trovi il file Excel con il dettaglio completo.</p>
     `;
 }
 
-// Funzione di normalizzazione robusta per i dati dei punti luce
-function normalizeLightPointData(lp) {
-    // Porta tutte le chiavi a minuscolo
-    const lowerCaseLp = {};
-    Object.keys(lp).forEach(key => {
-        lowerCaseLp[key.toLowerCase()] = lp[key];
-    });
-
-    // Mappa di conversione CSV → DB
-    const csvToDbFieldMap = {
-        'lampada_e_potenza': 'lampada_potenza',
-        'modello_armatura': 'modello',
-        // aggiungi qui altre conversioni se necessario
-    };
-
-    // Lista dei campi previsti dallo schema (tutti minuscoli)
-    const allowedFields = [
-        'marker', 'numero_palo', 'composizione_punto', 'indirizzo', 'lotto', 'quadro', 'proprieta',
-        'tipo_apparecchio', 'modello', 'numero_apparecchi', 'lampada_potenza', 'tipo_sostegno',
-        'tipo_linea', 'promiscuita', 'note', 'garanzia', 'lat', 'lng', 'pod', 'numero_contatore',
-        'alimentazione', 'potenza_contratto', 'potenza', 'punti_luce', 'tipo',
-        '_id', // per update
-        'segnalazioni_in_corso', 'segnalazioni_risolte', 'operazioni_effettuate'
-    ];
-
-    const normalized = {};
-    for (const key of allowedFields) {
-        // Se il campo esiste già con il nome giusto
-        if (lowerCaseLp.hasOwnProperty(key)) {
-            normalized[key] = lowerCaseLp[key];
+/**
+ * Dry-run import CSV: anteprima colonne/righe accettate vs scartate (senza scrivere).
+ * Body: { light_points: [...], mode: 'create'|'update', name? }
+ */
+router.post('/preview-import', requireSuperAdmin, async (req, res) => {
+    try {
+        const lightPoints = req.body?.light_points;
+        if (!Array.isArray(lightPoints)) {
+            return res.status(400).json({ error: 'light_points deve essere un array' });
         }
-        // Se il campo esiste con il nome del CSV, lo mappo
-        else {
-            // Cerco se c'è una chiave CSV che mappa su questo campo DB
-            const csvKey = Object.keys(csvToDbFieldMap).find(csvField => csvToDbFieldMap[csvField] === key);
-            if (csvKey && lowerCaseLp.hasOwnProperty(csvKey)) {
-                normalized[key] = lowerCaseLp[csvKey];
+
+        const mode = req.body?.mode === 'update' ? 'update' : 'create';
+        let existingIds = [];
+
+        if (mode === 'update') {
+            const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+            if (!name) {
+                return res.status(400).json({ error: 'name è obbligatorio in modalità update' });
             }
+            const th = await townHalls.findOne({ name }).select('punti_luce').lean();
+            if (!th) {
+                return res.status(404).json({ error: 'Comune non trovato' });
+            }
+            existingIds = (th.punti_luce || []).map(id => String(id));
         }
+
+        const preview = previewLightPointsImport(lightPoints, { mode, existingIds });
+        return res.json(preview);
+    } catch (err) {
+        console.error('Errore preview-import:', err);
+        return res.status(500).json({ error: 'Errore durante l\'anteprima del CSV' });
     }
-    return normalized;
-}
+});
 
-
-router.post('/update/', async (req, res) => {
+router.post('/update/', requireSuperAdmin, async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
     let responseStatus = 200;
@@ -320,6 +647,7 @@ router.post('/update/', async (req, res) => {
     let eliminatiFull = [];
     let modificatiFull = [];
     let aggiuntiFull = [];
+    let parentAmbiguities = [];
     // Costante per batch size
     const BATCH_SIZE = 100;
     try {
@@ -342,7 +670,10 @@ router.post('/update/', async (req, res) => {
                     subject: mailSubject,
                     html: mailHtml
                 };
-                await transporter.sendMail(mailOptions);
+                await sendMailAndNotify(mailOptions, {
+                    type: 'UPLOAD_ERROR',
+                    townHallName: req.body.name,
+                });
             } catch (e) {
                 debugMail('Errore nell\'invio email di notifica:', e);
             }
@@ -361,8 +692,61 @@ router.post('/update/', async (req, res) => {
             }
             return true;
         });
+
+        const parentMetaByIndex = [];
+        const docsForBulk = incomingPoints.map((lp, idx) => {
+            const split = splitParentCsvFields(lp);
+            parentMetaByIndex[idx] = {
+                numero_palo_parent: split.numero_palo_parent,
+                needsParentResolve: split.needsParentResolve,
+                childNumeroPalo: split.doc.numero_palo,
+                childMarker: split.doc.marker,
+                childId: lp._id ? String(lp._id) : null
+            };
+            const forDb = { ...split.doc };
+            if (lp._id) forDb._id = lp._id;
+            return forDb;
+        });
+
+        const coordErrors = [];
+        for (const doc of docsForBulk) {
+            const reasons = applyItalianCoordinatesToLightPoint(doc);
+            if (reasons.length > 0) {
+                coordErrors.push({
+                    marker: doc.marker,
+                    numero_palo: doc.numero_palo,
+                    reasons
+                });
+            }
+        }
+        if (coordErrors.length > 0) {
+            await session.abortTransaction();
+            session.endSession();
+            responseStatus = 400;
+            responseMessage = `Coordinate non valide in ${coordErrors.length} punti luce`;
+            mailSubject = 'Errore coordinate durante aggiornamento';
+            mailHtml = formatCoordErrorsHtml(coordErrors);
+            res.status(responseStatus).send(responseMessage);
+            try {
+                const adminEmails = req.body.userEmail;
+                const mailOptions = {
+                    from: `LIGHTING MAP<${emailLighting}>`,
+                    to: adminEmails,
+                    subject: mailSubject,
+                    html: mailHtml
+                };
+                await sendMailAndNotify(mailOptions, {
+                    type: 'UPLOAD_ERROR',
+                    townHallName: req.body.name,
+                });
+            } catch (e) {
+                debugMail('Errore nell\'invio email di notifica:', e);
+            }
+            return;
+        }
+
         // 4. Calcola cosa eliminare
-        const { toDelete } = diffLightPoints(existingIds, incomingPoints);
+        const { toDelete } = diffLightPoints(existingIds, docsForBulk);
         eliminati = [...toDelete];
         // Recupera i dati completi dei punti luce eliminati prima di cancellarli (in batch)
         if (eliminati.length > 0) {
@@ -373,8 +757,8 @@ router.post('/update/', async (req, res) => {
             }
         }
         // 5. Calcola modificati e aggiunti
-        modificati = incomingPoints.filter(lp => lp._id && existingIds.includes(lp._id.toString())).map(lp => lp._id);
-        aggiunti = incomingPoints.filter(lp => !lp._id);
+        modificati = docsForBulk.filter(lp => lp._id && existingIds.includes(lp._id.toString())).map(lp => lp._id);
+        aggiunti = docsForBulk.filter(lp => !lp._id);
 
         // 6. Elimina in batch
         if (toDelete.length > 0) {
@@ -384,17 +768,26 @@ router.post('/update/', async (req, res) => {
             }
         }
         // 7. Aggiorna/inserisci in batch
-        const bulkOps = prepareBulkOps(incomingPoints);
-        // Array per raccogliere i nuovi _id inseriti
-        let insertedIds = [];
+        const bulkOps = prepareBulkOps(docsForBulk);
+        const insertIncomingIndices = [];
+        docsForBulk.forEach((d, i) => {
+            if (!d._id) insertIncomingIndices.push(i);
+        });
+        // Array per raccogliere i nuovi _id inseriti (ordine = ordine insertOne)
+        let orderedInsertedIds = [];
         if (bulkOps.length > 0) {
             for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
                 const batchOps = bulkOps.slice(i, i + BATCH_SIZE);
                 try {
                     const result = await lightPoints.bulkWrite(batchOps, { session });
-                    // Estrai i nuovi _id dagli insertOne
                     if (result && result.insertedIds) {
-                        Object.values(result.insertedIds).forEach(id => insertedIds.push(id));
+                        const ids = result.insertedIds;
+                        const entries = ids instanceof Map
+                            ? [...ids.entries()]
+                            : Object.entries(ids);
+                        entries
+                            .sort((a, b) => Number(a[0]) - Number(b[0]))
+                            .forEach(([, id]) => orderedInsertedIds.push(id));
                     }
                 } catch (bulkErr) {
                     await session.abortTransaction();
@@ -419,7 +812,10 @@ router.post('/update/', async (req, res) => {
                             subject: mailSubject,
                             html: mailHtml
                         };
-                        await transporter.sendMail(mailOptions);
+                        await sendMailAndNotify(mailOptions, {
+                            type: 'UPLOAD_ERROR',
+                            townHallName: req.body.name,
+                        });
                         debugMail(bulkErr);
                     } catch (e) {
                         debugMail('Errore nell\'invio email:', e);
@@ -428,6 +824,13 @@ router.post('/update/', async (req, res) => {
                 }
             }
         }
+
+        insertIncomingIndices.forEach((incomingIdx, j) => {
+            if (orderedInsertedIds[j]) {
+                parentMetaByIndex[incomingIdx].childId = toIdString(orderedInsertedIds[j]);
+            }
+        });
+
         // 8. Recupera tutti gli _id aggiornati (inclusi quelli nuovi) in batch
         let updatedLightPoints = [];
         // Per i modificati
@@ -440,14 +843,33 @@ router.post('/update/', async (req, res) => {
             }
         }
         // Per gli aggiunti: ora abbiamo gli _id direttamente
-        if (insertedIds.length > 0) {
-            for (let i = 0; i < insertedIds.length; i += BATCH_SIZE) {
-                const batchIds = insertedIds.slice(i, i + BATCH_SIZE);
+        if (orderedInsertedIds.length > 0) {
+            for (let i = 0; i < orderedInsertedIds.length; i += BATCH_SIZE) {
+                const batchIds = orderedInsertedIds.slice(i, i + BATCH_SIZE);
                 const batchData = await lightPoints.find({ _id: { $in: batchIds } }).lean().session(session);
                 aggiuntiFull = aggiuntiFull.concat(batchData);
                 updatedLightPoints = updatedLightPoints.concat(batchData.map(lp => lp._id));
             }
         }
+
+        // 8b. Risolvi parent da numero_palo_parent sul comune aggiornato
+        const parentJobs = parentMetaByIndex
+            .filter(m => m && m.needsParentResolve && m.childId)
+            .map(m => ({
+                childId: m.childId,
+                childNumeroPalo: m.childNumeroPalo,
+                childMarker: m.childMarker,
+                numero_palo_parent: m.numero_palo_parent
+            }));
+        if (parentJobs.length > 0) {
+            const candidates = await lightPoints
+                .find({ _id: { $in: updatedLightPoints } })
+                .select('_id numero_palo marker')
+                .lean()
+                .session(session);
+            parentAmbiguities = await applyResolvedParents(parentJobs, candidates, session);
+        }
+
         // 9. Aggiorna la lista punti_luce del comune (solo ID unici)
         th.punti_luce = Array.from(new Set(updatedLightPoints));
         await th.save({ session });
@@ -474,7 +896,10 @@ router.post('/update/', async (req, res) => {
                 subject: mailSubject,
                 html: mailHtml
             };
-            await transporter.sendMail(mailOptions);
+            await sendMailAndNotify(mailOptions, {
+                type: 'UPLOAD_ERROR',
+                townHallName: req.body.name,
+            });
             debugMail(err);
         } catch (e) {
             debugMail('Errore nell\'invio email:', e);
@@ -501,7 +926,7 @@ router.post('/update/', async (req, res) => {
             XLSX.utils.book_append_sheet(workbook, wsVuoto, 'Nessuna Modifica');
         }
         const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-        mailHtml = returnHtmlEmailUpdateSuccessSummary(req.body.name, eliminati, modificati, aggiunti);
+        mailHtml = returnHtmlEmailUpdateSuccessSummary(req.body.name, eliminati, modificati, aggiunti, parentAmbiguities);
         res.status(responseStatus).send(responseMessage);
         // Invio email dopo la risposta
         try {
@@ -518,7 +943,10 @@ router.post('/update/', async (req, res) => {
                     }
                 ]
             };
-            await transporter.sendMail(mailOptions);
+            await sendMailAndNotify(mailOptions, {
+                type: 'UPLOAD_SUCCESS',
+                townHallName: req.body.name,
+            });
         } catch (e) {
             debugMail('Errore nell\'invio email di notifica:', e);
         }
@@ -527,31 +955,50 @@ router.post('/update/', async (req, res) => {
     }
 });
 
-router.patch('/lightPoints/update/:_id', async (req, res) => {
-
+router.patch('/lightPoints/update/:_id', requireLightPointEditor, async (req, res) => {
     const _id = req.params._id;
-    const lpToUpdate = req.body;
+
+    const townHall = await townHalls.findOne({ punti_luce: _id }).select('_id').lean();
+    if (!townHall) {
+        return res.status(404).send('Punto luce non trovato o non associato a un comune.');
+    }
+    if (!(await requireTownHallAccess(req, res, townHall._id))) return;
+
+    const lpToUpdate = sanitizeLightPointUpdate(req.body);
+
+    const coordErrors = applyItalianCoordinatesToLightPoint(lpToUpdate);
+    if (coordErrors.length > 0) {
+        return res.status(400).send('Coordinate non valide: ' + coordErrors.join('; '));
+    }
 
     try {
         const updatedLP = await lightPoints.findOneAndUpdate(
             { _id: _id },
-            lpToUpdate,
+            { $set: lpToUpdate },
             { new: true }
         );
 
         if (!updatedLP) {
-            return res.status(404).send("Punto luce non trovato.");
+            return res.status(404).send('Punto luce non trovato.');
         }
 
         res.send(updatedLP);
     } catch (error) {
-        res.status(500).send("Errore del server: " + error.message);
+        res.status(500).send('Errore del server: ' + error.message);
     }
 });
 
 router.get('/', async (req, res) => {
     try {
-        const thList = await townHalls.find({}).sort({ name: 1 }).collation({ locale: 'it', strength: 2 });;
+        const user = await loadRequestUser(req);
+        if (!user) {
+            return res.status(401).json({ error: 'Utente non autenticato' });
+        }
+
+        const filter = isSuperAdmin(user)
+            ? {}
+            : { _id: { $in: user.town_halls_list || [] } };
+        const thList = await townHalls.find(filter).sort({ name: 1 }).collation({ locale: 'it', strength: 2 });
 
         const transformedList = thList.map(th => {
             const thObject = th.toObject(); // Converte il documento Mongoose in un oggetto JavaScript
@@ -573,52 +1020,12 @@ router.get('/', async (req, res) => {
 
 router.get('/:name', async (req, res) => {
     try {
+        if (!(await requireTownHallAccessByName(req, res, req.params.name))) return;
+
         const th = await townHalls.findOne({ name: req.params.name })
             .populate({
                 path: 'punti_luce',
-                populate: [
-                    {
-                        path: 'segnalazioni_in_corso',
-                        model: 'reports',
-                        populate: {
-                            path: 'user_creator_id',
-                            model: 'users',
-                            select: 'name surname email'
-                        }
-                    },
-                    {
-                        path: 'segnalazioni_risolte',
-                        model: 'reports',
-                        populate: [{
-                            path: 'user_creator_id',
-                            model: 'users',
-                            select: 'name surname email'
-                        }, {
-                            path: 'user_responsible_id',
-                            model: 'users',
-                            select: 'name surname email'
-                        }]
-                    },
-                    {
-                        path: 'operazioni_effettuate',
-                        model: 'operations',
-                        populate: [
-                            {
-                                path: 'operation_point_id',
-                                model: 'lightPoints'
-                            },
-                            {
-                                path: 'operation_responsible',
-                                model: 'users',
-                                select: 'name surname email'
-                            },
-                            {
-                                path: 'report_to_solve',
-                                model: 'reports'
-                            }
-                        ]
-                    }
-                ]
+                populate: LIGHT_POINT_FULL_POPULATE
             });
 
         if (th) {
@@ -633,17 +1040,120 @@ router.get('/:name', async (req, res) => {
     }
 });
 
+/** Meta leggero: totale punti + centro senza populate */
+router.get('/:name/meta', async (req, res) => {
+    try {
+        if (!(await requireTownHallAccessByName(req, res, req.params.name))) return;
+
+        const th = await townHalls.findOne({ name: req.params.name })
+            .select('name punti_luce coordinates');
+        if (!th) {
+            return res.status(404).json({ error: 'Comune non trovato' });
+        }
+
+        const total = th.punti_luce ? th.punti_luce.length : 0;
+        let center = null;
+
+        if (th.coordinates?.lat != null && th.coordinates?.lng != null) {
+            const lat = parseCoordValue(th.coordinates.lat);
+            const lng = parseCoordValue(th.coordinates.lng);
+            if (lat != null && lng != null) {
+                center = { lat, lng };
+            }
+        }
+
+        // Se manca il centro sul comune, prova il primo punto luce (solo lat/lng)
+        if (!center && total > 0) {
+            const firstId = th.punti_luce[0];
+            const first = await lightPoints.findById(firstId).select('lat lng').lean();
+            if (first) {
+                const lat = parseCoordValue(first.lat);
+                const lng = parseCoordValue(first.lng);
+                if (lat != null && lng != null) {
+                    center = { lat, lng };
+                }
+            }
+        }
+
+        res.json({
+            name: th.name,
+            total,
+            center
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Errore del server' });
+    }
+});
+
+/**
+ * Pagina di punti luce con populate completo (stesso shape di GET /:name).
+ * Query: offset, limit (default 500, max 1000)
+ */
+router.get('/:name/lightPoints', async (req, res) => {
+    try {
+        if (!(await requireTownHallAccessByName(req, res, req.params.name))) return;
+
+        const { offset, limit } = parsePagination(req.query, 500);
+        const th = await townHalls.findOne({ name: req.params.name }).select('name punti_luce');
+        if (!th) {
+            return res.status(404).json({ error: 'Comune non trovato' });
+        }
+
+        const allIds = th.punti_luce || [];
+        const total = allIds.length;
+        const pageIds = allIds.slice(offset, offset + limit);
+
+        if (pageIds.length === 0) {
+            return res.json({
+                items: [],
+                total,
+                offset,
+                limit,
+                hasMore: false
+            });
+        }
+
+        const docs = await lightPoints.find({ _id: { $in: pageIds } })
+            .populate(LIGHT_POINT_FULL_POPULATE);
+
+        // Mantieni l'ordine degli ID del comune
+        const byId = new Map(docs.map(d => [d._id.toString(), d]));
+        const items = pageIds
+            .map(id => byId.get(id.toString()))
+            .filter(Boolean);
+
+        res.json({
+            items,
+            total,
+            offset,
+            limit,
+            hasMore: offset + limit < total
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Errore del server' });
+    }
+});
+
 router.get('/lightpoints/getActiveReports', async (req, res) => {
     try {
         const { name, numero_palo } = req.query;
+        if (!(await requireTownHallAccessByName(req, res, name))) return;
+
         const townHall = await townHalls.findOne({ name })
             .populate({
                 path: 'punti_luce',
                 match: { numero_palo },
                 populate: {
                     path: 'segnalazioni_in_corso',
-                    model: 'reports'
-                }
+                    model: 'reports',
+                    populate: {
+                        path: 'linked_quote_id',
+                        model: 'quotes',
+                        select: 'protocolNumber status type total dueDate',
+                    },
+                },
             });
 
         if (townHall && townHall.punti_luce.length > 0) {
@@ -666,8 +1176,9 @@ router.get('/lightpoints/getPoint/', async (req, res) => {
         if (!name || !numero_palo) {
             return res.status(400).send('Nome del comune e numero del palo sono richiesti.');
         }
+        if (!(await requireTownHallAccessByName(req, res, name))) return;
 
-        const townHall = await townHalls.findOne({ $eq: name }).populate({
+        const townHall = await townHalls.findOne({ name: { $eq: name } }).populate({
             path: 'punti_luce',
             match: { numero_palo: numero_palo },
         });
@@ -692,6 +1203,7 @@ router.get('/lightpoints/getPointGeoJSON/', async (req, res) => {
         if (!name || !numero_palo) {
             return res.status(400).send('Nome del comune e numero del palo sono richiesti.');
         }
+        if (!(await requireTownHallAccessByName(req, res, name))) return;
 
         const townHall = await townHalls.findOne({ name: name }).populate({
             path: 'punti_luce',
@@ -730,47 +1242,67 @@ router.get('/lightpoints/getPointGeoJSON/', async (req, res) => {
 
 router.get('/:name/geojson', async (req, res) => {
     try {
-        const th = await townHalls.findOne({ name: req.params.name })
-            .populate({
-                path: 'punti_luce',
-                populate: [
-                    { path: 'segnalazioni_in_corso', model: 'reports' },
-                    { path: 'segnalazioni_risolte', model: 'reports' },
-                    { path: 'operazioni_effettuate', model: 'operations',
-                        populate: [
-                            { path: 'operation_point_id', model: 'lightPoints' },
-                            { path: 'operation_responsible', model: 'users', select: 'name surname email' },
-                            { path: 'report_to_solve', model: 'reports' }
-                        ]
-                    }
-                ]
-            });
+        if (!(await requireTownHallAccessByName(req, res, req.params.name))) return;
 
+        const th = await townHalls.findOne({ name: req.params.name }).select('name punti_luce');
         if (!th || !th.punti_luce || th.punti_luce.length === 0) {
             return res.status(404).send('Comune o punti luce non trovati');
         }
 
-        // Costruisci la FeatureCollection GeoJSON
-        const features = th.punti_luce
+        const allIds = th.punti_luce;
+        const total = allIds.length;
+        const hasPagination =
+            req.query.offset !== undefined || req.query.limit !== undefined;
 
-            .map(pl => {
-                const props = pl.toObject ? pl.toObject() : pl;
-                const { lat, lng, ...rest } = props;
-                return {
-                    type: "Feature",
-                    geometry: {
-                        type: "Point",
-                        coordinates: [parseFloat(lng.replace(",", ".")), parseFloat(lat.replace(",", "."))]
-                    },
-                    properties: rest
-                };
-            });
+        let pageIds = allIds;
+        let offset = 0;
+        let limit = total;
+
+        if (hasPagination) {
+            ({ offset, limit } = parsePagination(req.query, 500));
+            pageIds = allIds.slice(offset, offset + limit);
+        }
+
+        if (pageIds.length === 0) {
+            const empty = {
+                type: 'FeatureCollection',
+                city: th.name,
+                features: []
+            };
+            if (hasPagination) {
+                return res.json({
+                    ...empty,
+                    total,
+                    offset,
+                    limit,
+                    hasMore: false
+                });
+            }
+            return res.json(empty);
+        }
+
+        const docs = await lightPoints.find({ _id: { $in: pageIds } })
+            .populate(GEOJSON_LIGHT_POINT_POPULATE);
+
+        const byId = new Map(docs.map(d => [d._id.toString(), d]));
+        const ordered = pageIds.map(id => byId.get(id.toString())).filter(Boolean);
+        const features = ordered.map(lightPointToGeoJsonFeature);
 
         const geojson = {
-            type: "FeatureCollection",
+            type: 'FeatureCollection',
             city: th.name,
             features
         };
+
+        if (hasPagination) {
+            return res.json({
+                ...geojson,
+                total,
+                offset,
+                limit,
+                hasMore: offset + limit < total
+            });
+        }
 
         res.json(geojson);
     } catch (err) {
@@ -793,8 +1325,10 @@ router.post('/api/downloadExcelTownHall', function (req, res) {
             return aVal.localeCompare(bVal, 'it', { numeric: false, sensitivity: 'base' });
         });
 
+        const enriched = enrichLightPointsWithNumeroPaloParent(sortedPuntiLuce);
+
         // Appiattisci l'oggetto JSON
-        const cleanedJson = sortedPuntiLuce
+        const cleanedJson = enriched
             .map(lp => ({ ...lp, name: jsonData.name }))
             .map(({ segnalazioni_in_corso, segnalazioni_risolte, operazioni_effettuate, name, __v, ...item }) => item)
             .map(item => Object.fromEntries(Object.entries(item).map(([key, value]) => key === '_id' ? [key, value] : [key.toUpperCase(), value])));
@@ -821,8 +1355,9 @@ router.post('/api/downloadCsvTownHall', function (req, res) {
     const jsonData = req.body;
     // Ordina i punti luce per numero_palo (come stringa)
     const sortedPuntiLuce = [...jsonData.punti_luce].sort(compareNumeroPalo);
+    const enriched = enrichLightPointsWithNumeroPaloParent(sortedPuntiLuce);
     // Appiattisci l'oggetto JSON come per l'XLSX
-    const cleanedJson = sortedPuntiLuce
+    const cleanedJson = enriched
         .map(lp => ({ ...lp, name: jsonData.name }))
         .map(({ segnalazioni_in_corso, segnalazioni_risolte, operazioni_effettuate, name, __v, ...item }) => item)
         .map(item => Object.fromEntries(Object.entries(item).map(([key, value]) => key === '_id' ? [key, value] : [key.toUpperCase(), value])));
@@ -856,6 +1391,7 @@ router.post('/lightPoints/viewport', async (req, res) => {
         if (!city || isNaN(north) || isNaN(south) || isNaN(east) || isNaN(west)) {
             return res.status(400).json({ error: 'Parametri mancanti o non validi' });
         }
+        if (!(await requireTownHallAccessByName(req, res, city))) return;
 
         // Trova il comune
         const townHall = await townHalls.findOne({ name: city }).select('punti_luce');
@@ -912,6 +1448,7 @@ router.post('/lightPoints/clusters', async (req, res) => {
         if (!city || north === undefined || south === undefined || east === undefined || west === undefined || isNaN(zoom)) {
             return res.status(400).json({ error: 'Parametri mancanti o non validi' });
         }
+        if (!(await requireTownHallAccessByName(req, res, city))) return;
 
         // Trova il comune
         const townHall = await townHalls.findOne({ name: city }).select('punti_luce');
@@ -999,18 +1536,19 @@ router.post('/lightPoints/clusters', async (req, res) => {
 // Restituisce: { "ComuneA": 1200, ... } solo per i comuni dell'utente se userId è fornito
 router.get('/lightPoints/counts', async (req, res) => {
     try {
-        const userId = req.query.userId;
+        const currentUser = await loadRequestUser(req);
+        if (!currentUser) {
+            return res.status(401).json({ error: 'Utente non autenticato' });
+        }
+
+        // Ignora userId arbitrario in query: conta solo i comuni accessibili all'utente autenticato
         let thList;
-        if (userId) {
-            // Recupera l'utente e la sua lista di comuni
-            const user = await users.findById(userId).select('town_halls_list');
-            if (!user || !user.town_halls_list || user.town_halls_list.length === 0) {
-                return res.json({});
-            }
-            thList = await townHalls.find({ _id: { $in: user.town_halls_list } }).select('name punti_luce');
-        } else {
-            // Nessun filtro utente, restituisci tutti i comuni
+        if (isSuperAdmin(currentUser)) {
             thList = await townHalls.find({}).select('name punti_luce');
+        } else if (!currentUser.town_halls_list || currentUser.town_halls_list.length === 0) {
+            return res.json({});
+        } else {
+            thList = await townHalls.find({ _id: { $in: currentUser.town_halls_list } }).select('name punti_luce');
         }
         const result = {};
         thList.forEach(th => {

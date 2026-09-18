@@ -1,0 +1,16 @@
+---
+description: Security audit focus for Lighting-Map API (authz, IDOR, secrets)
+alwaysApply: false
+---
+
+# Security audit — backend
+
+Quando l'utente chiede audit/security review, priorità:
+
+1. **AuthZ**: ogni mutate deve usare `requireRole` e/o `requireTownHallAccess` — JWT da solo non basta
+2. **Mai fidarsi del body** per ruolo/identità (`user_type`, `user_creator_id`, email responsabile) — sempre `req.user` / DB
+3. **Serialize utenti**: mai restituire `password`, token reset/confirm; usare `.select('-password …')`
+4. **IDOR**: check membership sul comune della risorsa, anche se `town_hall_id` è null
+5. **Rate limit** dedicato su `/login`, `/adminLogin`, email, push, upload grandi
+
+Output findings: tabella Severity | Location | Finding | Attack scenario. Ordina Critical → High → Medium. Non inventare issue senza evidenza nel codice.

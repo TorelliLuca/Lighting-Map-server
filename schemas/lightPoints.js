@@ -9,9 +9,11 @@ const schema = new Schema({
     quadro: {type: String, default: ""},
     proprieta: {type: String, default: ""},
     tipo_apparecchio: {type: String, default: ""},
-    modello: {type: String, default: ""},
+    marca_apparecchio: {type: String, default: ""},
+    modello_apparecchio: {type: String, default: ""},
     numero_apparecchi: {type: String, default: ""},
-    lampada_potenza: {type: String, default: ""},
+    tipo_lampada: {type: String, default: ""},
+    potenza_lampada: {type: String, default: ""},
     tipo_sostegno: {type: String, default: ""},
     tipo_linea: {type: String, default: ""},
     promiscuita: {type: String, default: ""},
@@ -26,14 +28,17 @@ const schema = new Schema({
     potenza: {type: String, default: ""},
     punti_luce: {type: String, default: ""},
     tipo: {type: String, default: ""},
+    altezza_sostegno: {type: String, default: ""},
+    /** Genitore topologico (QE o PL a monte). null = radice / scollegato. */
+    parent: { type: Schema.Types.ObjectId, ref: "lightPoints", default: null },
     segnalazioni_in_corso:[{type: Schema.Types.ObjectId, ref: "reports"}],
     segnalazioni_risolte:[{type: Schema.Types.ObjectId, ref: "reports"}],
     operazioni_effettuate: [{type: Schema.Types.ObjectId, ref: "operations"}]   ,
     data_creazione: { type: Date, default: Date.now },
 })
 
-//per esportare il modello
-module.exports = model("lightPoints", schema)
+schema.index({ quadro: 1, parent: 1 });
+schema.index({ parent: 1 });
 
 schema.post('findOneAndDelete', async function(doc) {
     if (doc) {
@@ -43,6 +48,9 @@ schema.post('findOneAndDelete', async function(doc) {
       );
     }
   });
+
+//per esportare il modello
+module.exports = model("lightPoints", schema)
 
 /*
 Punto luce spento

@@ -6,6 +6,7 @@ const emailTemplateAfterOperation = require('../email/afterOperation/htmlText');
 const emailTemplateConfirmEmail = require('../email/confirmEmail/htmlText');
 const emailResetPassword = require('../email/resetPassword/htmlText');
 const emailTemplateUserValidated = require('../email/userValidated/htmlText');
+const { formatParentAmbiguitiesHtml } = require('./utility');
 
 function returnHtmlEmail(username) {
   const htmlEmail = emailTemplate.replace('USERNAME', username);
@@ -69,7 +70,7 @@ function returnHtmlResetPassword(user, link) {
     return htmlEmail;
 }
 
-function returnHtmlEmailUploadSuccess(nomeComune, batchStatus) {
+function returnHtmlEmailUploadSuccess(nomeComune, batchStatus, parentAmbiguities = []) {
     return `
         <div style="font-family: Arial, sans-serif; background: #f4f6fb; padding: 32px;">
             <div style="max-width: 600px; margin: auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.07); padding: 32px;">
@@ -86,6 +87,7 @@ function returnHtmlEmailUploadSuccess(nomeComune, batchStatus) {
                         ${batchStatus.map(b => `<li style=\"margin-bottom: 4px;\">Batch <b>${b.batch}</b>: <span style=\"color: #388e3c;\">${b.status}</span></li>`).join('')}
                     </ul>
                 </div>
+                ${formatParentAmbiguitiesHtml(parentAmbiguities)}
                 <p style=\"color: #666; font-size: 15px; margin-top: 32px;\">
                     Grazie per aver utilizzato <b>Lighting Map</b>!<br>
                     <span style=\"font-size: 13px; color: #aaa;\">Questa è una notifica automatica, si prega di non rispondere a questa email.</span>
@@ -184,7 +186,6 @@ function formatDate(isoString) {
 }
 
 
-const jwt = require('jsonwebtoken');
 const { transporter, emailLighting, debugMail } = require('../config/email');
 
 // In-memory rate limiter: max 1 invii/5min per email
@@ -197,49 +198,92 @@ async function sendConfirmationEmail(user) {
     const now = Date.now();
     const email = user.email;
     if (!confirmationEmailRate[email]) confirmationEmailRate[email] = [];
-    // Rimuovi invii più vecchi diel ratelimit
+    // Rimuovi invii più vecchi del rate limit
     confirmationEmailRate[email] = confirmationEmailRate[email].filter(ts => now - ts < RATE_LIMIT_WINDOW);
     if (confirmationEmailRate[email].length >= RATE_LIMIT_MAX) {
         throw new Error('Hai raggiunto il limite di invii di mail di conferma per questa email. Riprova più tardi.');
     }
     confirmationEmailRate[email].push(now);
 
-    const token = jwt.sign({ id: user._id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '1d' });
-    const confirmUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/confirm-email?token=${token}`;
-    const html = returnHtmlConfirmEmail(user, confirmUrl);
+    const { createEmailConfirmToken } = require('./emailConfirmToken');
+    const { getFrontendBaseUrl } = require('./resetPasswordToken');
+    const { rawToken, hashedToken, expiresAt } = createEmailConfirmToken();
+
+    // Persisti hash one-time; salta oggetti non-Mongoose (es. test-mail)
+    if (typeof user.save === 'function') {
+        user.emailConfirmToken = hashedToken;
+        user.emailConfirmExpires = expiresAt;
+        try {
+            await user.save();
+        } catch (e) {
+            confirmationEmailRate[email].pop();
+            throw e;
+        }
+    }
+
+    const confirmUrl = `${getFrontendBaseUrl()}/confirm-email?token=${encodeURIComponent(rawToken)}`;
+
     try {
-        await transporter.sendMail({
-            from: `LIGHTING MAP - Conferma Email <${emailLighting}>`,
-            to: user.email,
-            subject: 'Conferma il tuo indirizzo email',
-            html,
-            attachments: [
-                {
-                    filename: 'image-1.gif',
-                    path: './email/confirmEmail/images/image-1.gif',
-                    cid: 'image1' 
-                },
-                {
-                    filename: 'image-2.png',
-                    path: './email/confirmEmail/images/image-2.png',
-                    cid: 'image2' 
-                },
-                {
-                    filename: 'image-3.png',
-                    path: './email/confirmEmail/images/image-3.png',
-                    cid: 'image3' 
-                },
-                {
-                    filename: 'image-4.png',
-                    path: './email/confirmEmail/images/image-4.png',
-                    cid: 'image4' 
-                }
-            ]
-        });
+        // Preferisci template configurabile da admin (EMAIL_CONFIRMATION)
+        let sentViaConfig = false;
+        if (user._id && typeof user.save === 'function') {
+            try {
+                const { sendConfiguredEmail } = require('./mailEngine');
+                const result = await sendConfiguredEmail('EMAIL_CONFIRMATION', {
+                    recipientUserIds: [user._id],
+                    vars: {
+                        nome: user.name || '',
+                        cognome: user.surname || '',
+                        email: user.email || '',
+                        url_confirm: confirmUrl,
+                    },
+                    fromName: 'LIGHTING MAP - Conferma Email',
+                });
+                sentViaConfig = Boolean(result && result.sent > 0);
+            } catch (configErr) {
+                debugMail(configErr);
+            }
+        }
+
+        if (!sentViaConfig) {
+            const html = returnHtmlConfirmEmail(user, confirmUrl);
+            await transporter.sendMail({
+                from: `LIGHTING MAP - Conferma Email <${emailLighting}>`,
+                to: user.email,
+                subject: 'Conferma il tuo indirizzo email',
+                html,
+                attachments: [
+                    {
+                        filename: 'image-1.gif',
+                        path: './email/confirmEmail/images/image-1.gif',
+                        cid: 'image1'
+                    },
+                    {
+                        filename: 'image-2.png',
+                        path: './email/confirmEmail/images/image-2.png',
+                        cid: 'image2'
+                    },
+                    {
+                        filename: 'image-3.png',
+                        path: './email/confirmEmail/images/image-3.png',
+                        cid: 'image3'
+                    },
+                    {
+                        filename: 'image-4.png',
+                        path: './email/confirmEmail/images/image-4.png',
+                        cid: 'image4'
+                    }
+                ]
+            });
+        }
     } catch (e) {
         debugMail(e);
-        // Rimuovi il timestamp se invio fallisce
         confirmationEmailRate[email].pop();
+        if (typeof user.save === 'function') {
+            user.emailConfirmToken = null;
+            user.emailConfirmExpires = null;
+            try { await user.save(); } catch (_) { /* ignore cleanup errors */ }
+        }
         throw e;
     }
 }
@@ -281,6 +325,18 @@ async function sendResetPasswordEmail(user, resetUrl) {
                 }
             ]
         });
+        if (user._id) {
+            const { createNotification, safeNotify } = require('./notificationHelpers');
+            await safeNotify(() =>
+                createNotification({
+                    userId: user._id,
+                    title: 'Reset password richiesto',
+                    body: 'Ti abbiamo inviato un link per reimpostare la password. Scade tra 1 ora.',
+                    type: 'PASSWORD_RESET',
+                    url: '/login',
+                })
+            );
+        }
     } catch (e) {
         debugMail(e);
         throw e;

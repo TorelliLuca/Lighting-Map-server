@@ -22,7 +22,12 @@ const organizationsSchema = new Schema({
     },
     responsible: { type: Schema.Types.ObjectId, ref: 'users' },
     townhallId: { type: Schema.Types.ObjectId, ref: 'townHalls' }, // Solo per 'TOWNHALL'
-    contracts: [{ // Solo per 'ENTERPRISE'
+    /**
+     * @deprecated Il legame manutentore↔comune vive sul capitolato
+     * (`maintenanceConfig.linkedOrganizations` con budget O/S).
+     * Mantenuto solo per lettura/migrazione legacy.
+     */
+    contracts: [{
         townhall_associated: { type: Schema.Types.ObjectId, ref: 'townHalls' },
         start_date: { type: Date },
         end_date: { type: Date },
