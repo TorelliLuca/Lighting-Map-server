@@ -461,6 +461,13 @@ router.post('/newsletter', newsletterLimiter, async (req, res) => {
             return res.status(400).json({ error: 'subject e htmlBody sono obbligatori' });
         }
 
+        const alreadySending = await NewsletterLog.exists({ status: 'SENDING' });
+        if (alreadySending) {
+            return res.status(409).json({
+                error: 'C\'è già una campagna in corso. Attendi il completamento prima di inviarne un\'altra.',
+            });
+        }
+
         let recipients = [];
 
         if (Array.isArray(userIds) && userIds.length > 0) {
@@ -492,10 +499,52 @@ router.post('/newsletter', newsletterLimiter, async (req, res) => {
             });
         }
 
+        const log = await NewsletterLog.create({
+            subject,
+            senderId: req.currentUser._id,
+            recipientCount: recipients.length,
+            sentCount: 0,
+            failedCount: 0,
+            filters: filters || { userIds },
+            userIds: recipients.map((r) => r._id).filter(Boolean),
+            results: [],
+            status: 'SENDING',
+            errorMessage: null,
+        });
+
+        // Risposta immediata: l'invio continua in background e aggiorna il log
+        res.status(202).json({
+            started: true,
+            logId: log._id,
+            recipientCount: recipients.length,
+            status: 'SENDING',
+        });
+
+        setImmediate(() => {
+            runNewsletterJob(log._id, { subject, htmlBody, recipients }).catch((err) => {
+                console.error('Newsletter background job failed:', err);
+            });
+        });
+    } catch (error) {
+        console.error('POST newsletter:', error);
+        if (!res.headersSent) {
+            return res.status(500).json({ error: 'Errore del server' });
+        }
+    }
+});
+
+async function runNewsletterJob(logId, { subject, htmlBody, recipients }) {
+    try {
         const result = await sendNewsletter({
             subject,
             htmlBody,
             recipients,
+            onProgress: async ({ sent, failed, lastResult }) => {
+                await NewsletterLog.findByIdAndUpdate(logId, {
+                    $set: { sentCount: sent, failedCount: failed },
+                    $push: { results: lastResult },
+                });
+            },
         });
 
         const status = result.errors.length === 0
@@ -504,32 +553,24 @@ router.post('/newsletter', newsletterLimiter, async (req, res) => {
                 ? 'PARTIAL'
                 : 'FAILED';
 
-        const log = await NewsletterLog.create({
-            subject,
-            senderId: req.currentUser._id,
-            recipientCount: recipients.length,
-            sentCount: result.sent,
-            failedCount: result.errors.length,
-            filters: filters || { userIds },
-            userIds: recipients.map((r) => r._id).filter(Boolean),
-            results: result.results,
-            status,
-            errorMessage: result.errors.length ? result.errors.slice(0, 5).join('; ') : null,
-        });
-
-        return res.json({
-            sent: result.sent,
-            failed: result.errors.length,
-            status,
-            logId: log._id,
-            errors: result.errors.slice(0, 10),
+        await NewsletterLog.findByIdAndUpdate(logId, {
+            $set: {
+                sentCount: result.sent,
+                failedCount: result.errors.length,
+                status,
+                errorMessage: result.errors.length ? result.errors.slice(0, 5).join('; ') : null,
+            },
         });
     } catch (error) {
-        console.error('POST newsletter:', error);
-        return res.status(500).json({ error: 'Errore del server' });
+        console.error('runNewsletterJob:', error);
+        await NewsletterLog.findByIdAndUpdate(logId, {
+            $set: {
+                status: 'FAILED',
+                errorMessage: error.message || String(error),
+            },
+        }).catch(() => {});
     }
-});
-
+}
 // POST /api/email-settings/newsletter/count — anteprima conteggio destinatari
 router.post('/newsletter/count', async (req, res) => {
     try {

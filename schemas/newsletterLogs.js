@@ -26,14 +26,15 @@ const schema = new Schema({
     results: { type: [recipientResultSchema], default: undefined },
     status: {
         type: String,
-        enum: ['SUCCESS', 'PARTIAL', 'FAILED'],
+        enum: ['SENDING', 'SUCCESS', 'PARTIAL', 'FAILED'],
         default: 'SUCCESS',
     },
     errorMessage: { type: String, default: null },
 }, {
-    timestamps: { createdAt: true, updatedAt: false },
+    timestamps: true,
 });
 
 schema.index({ createdAt: -1 });
+schema.index({ status: 1, createdAt: -1 });
 
 module.exports = model('newsletterLogs', schema);

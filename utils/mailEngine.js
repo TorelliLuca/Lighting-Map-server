@@ -6,11 +6,49 @@ const { cloneDefaults, getDefaultByKey } = require('./emailActionConfigDefaults'
 const { mapEmailPlaceholderValue } = require('./emailDisplayLabels');
 
 const PLACEHOLDER_RE = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
-const BATCH_SIZE = 20;
-const BATCH_DELAY_MS = 100;
+
+/** Aruba rifiuta connessioni parallele: invio strettamente sequenziale. */
+const SEND_DELAY_MS = 400;
+const SEND_MAX_RETRIES = 3;
+const RETRY_BASE_DELAY_MS = 2000;
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientSmtpError(err) {
+    const msg = String(err?.message || err || '');
+    const code = err?.responseCode || err?.code;
+    return (
+        code === 421
+        || code === 450
+        || code === 451
+        || code === 452
+        || /too many connections/i.test(msg)
+        || /try later/i.test(msg)
+        || /ECONNRESET|ETIMEDOUT|ESOCKET/i.test(msg)
+    );
+}
+
+/**
+ * sendMail con retry su errori SMTP transienti (es. Aruba 421).
+ */
+async function sendMailWithRetry(mailOptions) {
+    let lastErr;
+    for (let attempt = 0; attempt <= SEND_MAX_RETRIES; attempt += 1) {
+        try {
+            return await transporter.sendMail(mailOptions);
+        } catch (err) {
+            lastErr = err;
+            if (attempt >= SEND_MAX_RETRIES || !isTransientSmtpError(err)) {
+                throw err;
+            }
+            const wait = RETRY_BASE_DELAY_MS * (attempt + 1);
+            debugMail(`SMTP transient error, retry ${attempt + 1}/${SEND_MAX_RETRIES} in ${wait}ms: ${err.message}`);
+            await sleep(wait);
+        }
+    }
+    throw lastErr;
 }
 
 /**
@@ -205,39 +243,37 @@ async function sendConfiguredEmail(actionKey, context = {}) {
     const errors = [];
     let sent = 0;
 
-    for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
-        const batch = recipients.slice(i, i + BATCH_SIZE);
-        await Promise.all(batch.map(async (recipient) => {
-            // Destinatario come default; context.vars ha priorità (es. dati segnalante in REPORT_CREATED)
-            const vars = {
-                nome: recipient.name || '',
-                cognome: recipient.surname || '',
-                email: recipient.email || '',
-                ...baseVars,
-            };
+    for (let i = 0; i < recipients.length; i += 1) {
+        const recipient = recipients[i];
+        // Destinatario come default; context.vars ha priorità (es. dati segnalante in REPORT_CREATED)
+        const vars = {
+            nome: recipient.name || '',
+            cognome: recipient.surname || '',
+            email: recipient.email || '',
+            ...baseVars,
+        };
 
-            const subject = renderTemplate(config.subjectTemplate, vars, config.allowedPlaceholders);
-            const html = renderTemplate(config.bodyTemplate, vars, config.allowedPlaceholders);
+        const subject = renderTemplate(config.subjectTemplate, vars, config.allowedPlaceholders);
+        const html = renderTemplate(config.bodyTemplate, vars, config.allowedPlaceholders);
 
-            try {
-                await transporter.sendMail({
-                    from: fromLabel,
-                    to: recipient.email,
-                    subject,
-                    html,
-                    attachments,
-                });
-                sent += 1;
-                debugMail(`Email ${actionKey} sent to ${recipient.email}`);
-            } catch (err) {
-                const msg = err.message || String(err);
-                errors.push(`${recipient.email}: ${msg}`);
-                debugMail(`Email ${actionKey} error for ${recipient.email}: ${msg}`);
-            }
-        }));
+        try {
+            await sendMailWithRetry({
+                from: fromLabel,
+                to: recipient.email,
+                subject,
+                html,
+                attachments,
+            });
+            sent += 1;
+            debugMail(`Email ${actionKey} sent to ${recipient.email}`);
+        } catch (err) {
+            const msg = err.message || String(err);
+            errors.push(`${recipient.email}: ${msg}`);
+            debugMail(`Email ${actionKey} error for ${recipient.email}: ${msg}`);
+        }
 
-        if (i + BATCH_SIZE < recipients.length) {
-            await sleep(BATCH_DELAY_MS);
+        if (i + 1 < recipients.length) {
+            await sleep(SEND_DELAY_MS);
         }
     }
 
@@ -246,47 +282,66 @@ async function sendConfiguredEmail(actionKey, context = {}) {
 
 /**
  * Invio newsletter one-shot (bypass config azioni).
+ * @param {object} opts
+ * @param {(progress: { processed: number, total: number, sent: number, failed: number, lastResult: object }) => void|Promise<void>} [opts.onProgress]
  * @returns {{ sent: number, errors: string[], results: Array<{userId,email,name,surname,status,error}> }}
  */
-async function sendNewsletter({ subject, htmlBody, recipients, fromName }) {
+async function sendNewsletter({ subject, htmlBody, recipients, fromName, onProgress }) {
     const fromLabel = fromName || `LIGHTING MAP <${emailLighting}>`;
     const errors = [];
     const results = [];
     let sent = 0;
+    const total = recipients.length;
 
-    for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
-        const batch = recipients.slice(i, i + BATCH_SIZE);
-        await Promise.all(batch.map(async (recipient) => {
-            const base = {
-                userId: recipient._id || null,
-                email: recipient.email || '',
-                name: recipient.name || '',
-                surname: recipient.surname || '',
-            };
-            const vars = {
-                nome: base.name,
-                cognome: base.surname,
-                email: base.email,
-            };
-            const html = renderTemplate(htmlBody, vars);
-            const subj = renderTemplate(subject, vars);
+    for (let i = 0; i < recipients.length; i += 1) {
+        const recipient = recipients[i];
+        const base = {
+            userId: recipient._id || null,
+            email: recipient.email || '',
+            name: recipient.name || '',
+            surname: recipient.surname || '',
+        };
+        const vars = {
+            nome: base.name,
+            cognome: base.surname,
+            email: base.email,
+        };
+        const html = renderTemplate(htmlBody, vars);
+        const subj = renderTemplate(subject, vars);
+        let lastResult;
+        try {
+            await sendMailWithRetry({
+                from: fromLabel,
+                to: recipient.email,
+                subject: subj,
+                html,
+            });
+            sent += 1;
+            lastResult = { ...base, status: 'SENT', error: null };
+            results.push(lastResult);
+        } catch (err) {
+            const message = err.message || String(err);
+            errors.push(`${recipient.email}: ${message}`);
+            lastResult = { ...base, status: 'FAILED', error: message };
+            results.push(lastResult);
+        }
+
+        if (typeof onProgress === 'function') {
             try {
-                await transporter.sendMail({
-                    from: fromLabel,
-                    to: recipient.email,
-                    subject: subj,
-                    html,
+                await onProgress({
+                    processed: i + 1,
+                    total,
+                    sent,
+                    failed: errors.length,
+                    lastResult,
                 });
-                sent += 1;
-                results.push({ ...base, status: 'SENT', error: null });
-            } catch (err) {
-                const message = err.message || String(err);
-                errors.push(`${recipient.email}: ${message}`);
-                results.push({ ...base, status: 'FAILED', error: message });
+            } catch (progressErr) {
+                debugMail(`Newsletter onProgress error: ${progressErr.message || progressErr}`);
             }
-        }));
-        if (i + BATCH_SIZE < recipients.length) {
-            await sleep(BATCH_DELAY_MS);
+        }
+
+        if (i + 1 < recipients.length) {
+            await sleep(SEND_DELAY_MS);
         }
     }
 
