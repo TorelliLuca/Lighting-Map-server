@@ -3,6 +3,7 @@ const townHalls = require('../schemas/townHalls');
 const EmailActionConfig = require('../schemas/emailActionConfig');
 const { transporter, emailLighting, debugMail } = require('../config/email');
 const { cloneDefaults, getDefaultByKey } = require('./emailActionConfigDefaults');
+const { mapEmailPlaceholderValue } = require('./emailDisplayLabels');
 
 const PLACEHOLDER_RE = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
 const BATCH_SIZE = 20;
@@ -15,6 +16,7 @@ function sleep(ms) {
 /**
  * Interpola {{placeholder}} usando solo le chiavi in whitelist (o tutte se whitelist vuota).
  * Placeholder sconosciuti → stringa vuota.
+ * Codici DB (stato, esito, tipo segnalazione/operazione) → etichette italiane.
  */
 function renderTemplate(str, vars = {}, allowedPlaceholders = null) {
     if (typeof str !== 'string') return '';
@@ -24,7 +26,7 @@ function renderTemplate(str, vars = {}, allowedPlaceholders = null) {
 
     return str.replace(PLACEHOLDER_RE, (_, key) => {
         if (allow && !allow.has(key)) return '';
-        const value = vars[key];
+        const value = mapEmailPlaceholderValue(key, vars[key]);
         if (value === undefined || value === null) return '';
         return String(value);
     });
@@ -244,19 +246,27 @@ async function sendConfiguredEmail(actionKey, context = {}) {
 
 /**
  * Invio newsletter one-shot (bypass config azioni).
+ * @returns {{ sent: number, errors: string[], results: Array<{userId,email,name,surname,status,error}> }}
  */
 async function sendNewsletter({ subject, htmlBody, recipients, fromName }) {
     const fromLabel = fromName || `LIGHTING MAP <${emailLighting}>`;
     const errors = [];
+    const results = [];
     let sent = 0;
 
     for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
         const batch = recipients.slice(i, i + BATCH_SIZE);
         await Promise.all(batch.map(async (recipient) => {
-            const vars = {
-                nome: recipient.name || '',
-                cognome: recipient.surname || '',
+            const base = {
+                userId: recipient._id || null,
                 email: recipient.email || '',
+                name: recipient.name || '',
+                surname: recipient.surname || '',
+            };
+            const vars = {
+                nome: base.name,
+                cognome: base.surname,
+                email: base.email,
             };
             const html = renderTemplate(htmlBody, vars);
             const subj = renderTemplate(subject, vars);
@@ -268,8 +278,11 @@ async function sendNewsletter({ subject, htmlBody, recipients, fromName }) {
                     html,
                 });
                 sent += 1;
+                results.push({ ...base, status: 'SENT', error: null });
             } catch (err) {
-                errors.push(`${recipient.email}: ${err.message || err}`);
+                const message = err.message || String(err);
+                errors.push(`${recipient.email}: ${message}`);
+                results.push({ ...base, status: 'FAILED', error: message });
             }
         }));
         if (i + BATCH_SIZE < recipients.length) {
@@ -277,7 +290,7 @@ async function sendNewsletter({ subject, htmlBody, recipients, fromName }) {
         }
     }
 
-    return { sent, errors };
+    return { sent, errors, results };
 }
 
 module.exports = {

@@ -6,9 +6,7 @@ const MaintenanceConfig = require('../schemas/maintenanceConfig');
 const mongoose = require('mongoose');
 const {
     findActiveConfig,
-    getOrCreateActiveConfig,
     buildValidityMeta,
-    enrichConfigDocument,
 } = require('../utils/maintenanceConfigHelpers');
 const {
     requireRole,
@@ -73,7 +71,7 @@ router.get('/all-organizations', requireSuperAdmin, async (req, res) => {
 
 /**
  * Organizzazioni manutentori del comune, legate al capitolato attivo
- * (con budget ordinaria/straordinaria). Fallback legacy su contracts[].
+ * (linkedOrganizations con budget ordinaria/straordinaria).
  */
 router.get('/townhall/:townhallId', async (req, res) => {
     try {
@@ -116,46 +114,6 @@ router.get('/townhall/:townhallId', async (req, res) => {
                     notes: item.notes || '',
                 });
             }
-        } else {
-            const townHall = await townHalls.findById(townHallOid)
-                .select('organizations_maintainers')
-                .lean();
-            const maintainerIds = (townHall?.organizations_maintainers || []).map(String);
-
-            const byContract = await organizations.find({
-                type: 'ENTERPRISE',
-                'contracts.townhall_associated': townHallOid,
-            })
-                .populate(populateMembersSafe)
-                .populate(populateResponsibleSafe)
-                .lean();
-
-            const byMaintainer = maintainerIds.length > 0
-                ? await organizations.find({
-                    _id: { $in: maintainerIds },
-                    type: 'ENTERPRISE',
-                })
-                    .populate(populateMembersSafe)
-                    .populate(populateResponsibleSafe)
-                    .lean()
-                : [];
-
-            const byId = new Map();
-            for (const org of [...byContract, ...byMaintainer]) {
-                byId.set(String(org._id), org);
-            }
-            orgDocs = [...byId.values()];
-
-            for (const org of orgDocs) {
-                const contract = (org.contracts || []).find(
-                    (c) => String(c.townhall_associated) === String(townHallOid)
-                );
-                bindingByOrgId.set(String(org._id), {
-                    budgetOrdinary: Number(contract?.price) || 0,
-                    budgetExtraordinary: 0,
-                    notes: contract?.details || '',
-                });
-            }
         }
 
         orgDocs.sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'it', { sensitivity: 'base' }));
@@ -196,7 +154,6 @@ router.get('/townhall/:townhallId', async (req, res) => {
                 budgetOrdinary: binding.budgetOrdinary,
                 budgetExtraordinary: binding.budgetExtraordinary,
                 bindingNotes: binding.notes,
-                contracts: [],
             };
         });
 
@@ -296,72 +253,15 @@ router.put('/remove-user-from-organization', requireSuperAdmin, async (req, res)
 });
 
 /**
- * @deprecated Preferire ParametriCapitolato → linkedOrganizations.
- * Compatibilità: collega l'org al capitolato attivo del comune con budget O/S.
+ * Endpoint rimosso: il collegamento impresa↔comune avviene solo da
+ * Parametri capitolato → linkedOrganizations.
  */
-router.put('/add-contract-to-organization', requireSuperAdmin, async (req, res) => {
-    const { organizationId, contract, budgetOrdinary, budgetExtraordinary } = req.body;
-    try {
-        const organization = await organizations.findById(organizationId);
-        if (!organization) return res.status(404).send('Organizzazione non trovata');
-        if (organization.type !== 'ENTERPRISE') {
-            return res.status(400).json({ error: 'Solo organizzazioni ENTERPRISE possono essere collegate al capitolato' });
-        }
-
-        const townhallId = contract?.townhall_associated || contract?.associated_townhall_id;
-        if (!townhallId || !mongoose.Types.ObjectId.isValid(townhallId)) {
-            return res.status(400).json({ error: 'Comune (townhall_associated) obbligatorio' });
-        }
-
-        const townhallToUpdate = await townHalls.findById(townhallId);
-        if (!townhallToUpdate) {
-            return res.status(404).json({ error: 'Comune non trovato' });
-        }
-
-        const config = await getOrCreateActiveConfig(townhallId, null);
-        const existing = (config.linkedOrganizations || []).find(
-            (item) => String(item.organizationId) === String(organizationId)
-        );
-        const ordinary = budgetOrdinary != null
-            ? Number(budgetOrdinary)
-            : (existing ? Number(existing.budgetOrdinary) || 0 : Number(contract?.price) || 0);
-        const extraordinary = budgetExtraordinary != null
-            ? Number(budgetExtraordinary)
-            : (existing ? Number(existing.budgetExtraordinary) || 0 : 0);
-
-        if (!Number.isFinite(ordinary) || ordinary < 0 || !Number.isFinite(extraordinary) || extraordinary < 0) {
-            return res.status(400).json({ error: 'I budget devono essere numeri >= 0' });
-        }
-
-        if (existing) {
-            existing.budgetOrdinary = ordinary;
-            existing.budgetExtraordinary = extraordinary;
-            if (contract?.details) existing.notes = String(contract.details);
-        } else {
-            config.linkedOrganizations.push({
-                organizationId: organization._id,
-                budgetOrdinary: ordinary,
-                budgetExtraordinary: extraordinary,
-                notes: contract?.details ? String(contract.details) : '',
-            });
-        }
-        await config.save();
-
-        if (!townhallToUpdate.organizations_maintainers.some((id) => String(id) === String(organization._id))) {
-            townhallToUpdate.organizations_maintainers.push(organization._id);
-            await townhallToUpdate.save();
-        }
-
-        const enriched = await enrichConfigDocument(config);
-        res.status(200).json({
-            organization,
-            capitolato: enriched,
-            message: 'Organizzazione collegata al capitolato attivo del comune',
-        });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Errore interno del server' });
-    }
+router.put('/add-contract-to-organization', requireSuperAdmin, async (_req, res) => {
+    return res.status(410).json({
+        error: 'Endpoint dismesso',
+        message:
+            'Il collegamento delle imprese ai comuni va gestito esclusivamente da Parametri capitolato → Organizzazioni (linkedOrganizations).',
+    });
 });
 
 router.put('/associate-townhall-to-organization', requireSuperAdmin, async (req, res) => {
@@ -374,6 +274,13 @@ router.put('/associate-townhall-to-organization', requireSuperAdmin, async (req,
             await session.abortTransaction();
             session.endSession();
             return res.status(404).send('Organizzazione non trovata');
+        }
+        if (organization.type !== 'TOWNHALL') {
+            await session.abortTransaction();
+            session.endSession();
+            return res.status(400).json({
+                error: 'Solo organizzazioni di tipo TOWNHALL possono essere associate a un comune piattaforma. Per le imprese usa Parametri capitolato.',
+            });
         }
         organization.townhallId = townhallId;
         await organization.save();

@@ -12,6 +12,7 @@ const { getAllPuntiLuce } = require('../utils/lightPointHelpers');
 const { STAFF_ROLES, requireRole, requireTownHallAccess } = require('../utils/roles');
 const { transitionReportStatus, resolvePlantContext, assertFaultLabelForMarker } = require('../utils/reportHelpers');
 const { appendStatusHistory } = require('../utils/statusHistory');
+const { computeScheduledResolutionAtSurvey } = require('../utils/maintenanceConfigHelpers');
 const {
     createNotifications,
     notifyTownHallStaff,
@@ -19,6 +20,7 @@ const {
     buildLightPointDashboardUrl,
 } = require('../utils/notificationHelpers');
 const { sendConfiguredEmail } = require('../utils/mailEngine');
+const { mapEmailPlaceholderValue } = require('../utils/emailDisplayLabels');
 const { computeQuoteTotals } = require('../utils/quoteDocuments');
 const logAccess = require('../utils/accessLogger');
 
@@ -51,6 +53,7 @@ router.post('/', requireRole('MAINTAINER', 'SUPER_ADMIN', 'ADMINISTRATOR'), asyn
             report_type,
             suspension_reason,
             suspension_days,
+            extension_days,
             notes,
         } = req.body || {};
 
@@ -107,6 +110,8 @@ router.post('/', requireRole('MAINTAINER', 'SUPER_ADMIN', 'ADMINISTRATOR'), asyn
 
         let report = null;
         let classificationModified = false;
+        let riskClassAtReport = null;
+        let preSurveyDueDate = null;
 
         if (isDirectDiscovery) {
             const existingOrdinaryOpen = (puntoLuceDoc.segnalazioni_in_corso || []).find((item) => {
@@ -162,6 +167,8 @@ router.post('/', requireRole('MAINTAINER', 'SUPER_ADMIN', 'ADMINISTRATOR'), asyn
             });
             await report.save({ session });
             puntoLuceDoc.segnalazioni_in_corso.push(report);
+            riskClassAtReport = risk_class || null;
+            preSurveyDueDate = null;
         } else {
             report = (puntoLuceDoc.segnalazioni_in_corso || []).find(
                 (item) => String(item._id) === String(report_id)
@@ -192,6 +199,9 @@ router.post('/', requireRole('MAINTAINER', 'SUPER_ADMIN', 'ADMINISTRATOR'), asyn
                 session.endSession();
                 return res.status(409).json({ error: 'Esiste già un sopralluogo per questa segnalazione' });
             }
+
+            riskClassAtReport = report.risk_class || null;
+            preSurveyDueDate = report.due_date || null;
 
             const previousRisk = report.risk_class;
             const previousFault = report.fault_label;
@@ -236,6 +246,13 @@ router.post('/', requireRole('MAINTAINER', 'SUPER_ADMIN', 'ADMINISTRATOR'), asyn
         let quoteId = null;
         let redirectTo = '/dashboard';
         let askCompileQuote = false;
+        let materialExtensionDays = null;
+
+        // La due_date pre-sopralluogo non resta attiva dopo l'esito,
+        // tranne dove viene ricalcolata (SCHEDULED / SUSPENDED) da preSurveyDueDate.
+        if (outcome !== 'SCHEDULED' && outcome !== 'SUSPENDED') {
+            report.due_date = null;
+        }
 
         if (outcome === 'RESOLVED') {
             const operation = new operations({
@@ -269,42 +286,89 @@ router.post('/', requireRole('MAINTAINER', 'SUPER_ADMIN', 'ADMINISTRATOR'), asyn
                 session.endSession();
                 return res.status(400).json({ error: 'Indicare i giorni di sospensione (minimo 1)' });
             }
+
+            const config = await MaintenanceConfig.findOne({ townHallId: th._id, status: 'active' }).session(session);
+            const suspended = computeScheduledResolutionAtSurvey({
+                config,
+                reportDate: report.report_date || new Date(),
+                originalDueDate: preSurveyDueDate,
+                originalRiskClass: riskClassAtReport,
+                confirmedRiskClass: report.risk_class || risk_class || 'C',
+                extensionDays: Math.floor(suspensionDays),
+            });
+            if (!suspended.ok) {
+                await session.abortTransaction();
+                session.endSession();
+                return res.status(400).json({ error: suspended.error });
+            }
+
+            materialExtensionDays = suspended.extensionDays;
             report.suspension = {
                 reason: suspension_reason.trim(),
                 days: Math.floor(suspensionDays),
                 suspendedAt: new Date(),
                 suspendedBy: inspector._id,
             };
+            // Scadenza effettiva = base capitolato (conservata o ricalcolata) + estensione
+            report.due_date = suspended.dueDate;
+            report.scheduled_resolution_date = null;
+
+            const modeNote = suspended.mode === 'KEEP_ORIGINAL'
+                ? 'scadenza segnalazione + estensione'
+                : suspended.mode === 'CLASS_ADJUSTED'
+                    ? `classe ${suspended.originalRiskClass || '?'}→${suspended.code} + estensione`
+                    : 'timer capitolato + estensione';
+
             transitionReportStatus(
                 report,
                 'SUSPENDED',
                 inspector._id,
-                `${suspension_reason.trim()} (${Math.floor(suspensionDays)} giorni)`
+                `${suspension_reason.trim()} (${Math.floor(suspensionDays)} gg) — ${modeNote} → scadenza ${suspended.dueDate.toLocaleDateString('it-IT')}`
             );
         } else if (outcome === 'SCHEDULED') {
-            // Scadenza dai termini capitolato: giorni materiale + giorni opera
             const config = await MaintenanceConfig.findOne({ townHallId: th._id, status: 'active' }).session(session);
-            const riskCode = report.risk_class || 'C';
-            const riskCfg = (config?.riskClasses || []).find((r) => r.code === riskCode);
-            const materialDays = Number(riskCfg?.defaultMaterialDays) || 0;
-            const workDays = Number(riskCfg?.defaultWorkDays) || 0;
-            const leadDays = materialDays + workDays;
-            if (leadDays < 1) {
+            const extRaw = extension_days;
+            const extDays = extRaw === undefined || extRaw === null || extRaw === ''
+                ? 0
+                : Number(extRaw);
+            if (!Number.isFinite(extDays) || extDays < 0) {
                 await session.abortTransaction();
                 session.endSession();
-                return res.status(400).json({
-                    error: `Termini capitolato non configurati per la classe ${riskCode}`,
-                });
+                return res.status(400).json({ error: 'I giorni di estensione devono essere un numero ≥ 0' });
             }
-            const scheduled = new Date();
-            scheduled.setHours(0, 0, 0, 0);
-            scheduled.setDate(scheduled.getDate() + leadDays);
-            report.scheduled_resolution_date = scheduled;
+
+            const scheduled = computeScheduledResolutionAtSurvey({
+                config,
+                reportDate: report.report_date || new Date(),
+                originalDueDate: preSurveyDueDate,
+                originalRiskClass: riskClassAtReport,
+                confirmedRiskClass: report.risk_class || risk_class || 'C',
+                extensionDays: extDays,
+            });
+            if (!scheduled.ok) {
+                await session.abortTransaction();
+                session.endSession();
+                return res.status(400).json({ error: scheduled.error });
+            }
+
+            materialExtensionDays = scheduled.extensionDays;
+            report.scheduled_resolution_date = scheduled.dueDate;
+            report.due_date = null;
+
+            const modeNote = scheduled.mode === 'KEEP_ORIGINAL'
+                ? 'scadenza segnalazione conservata'
+                : scheduled.mode === 'CLASS_ADJUSTED'
+                    ? `classe ${scheduled.originalRiskClass || '?'}→${scheduled.code}, ricalcolo capitolato (−${scheduled.elapsedDays} gg trascorsi)`
+                    : 'nuovo timer da sopralluogo';
+            const extNote = scheduled.extensionDays > 0
+                ? ` + ${scheduled.extensionDays} gg estensione materiali`
+                : '';
+
             transitionReportStatus(
                 report,
                 'SCHEDULED',
                 inspector._id,
-                notes || `Risoluzione differita — classe ${riskCode}, ${leadDays} giorni (${materialDays} materiale + ${workDays} opera, capitolato)`
+                notes || `Risoluzione differita — ${modeNote}${extNote} — classe ${scheduled.code}, scadenza ${scheduled.dueDate.toLocaleDateString('it-IT')}`
             );
         } else if (outcome === 'SAFE_PENDING_RESTORATION') {
             // 1) Messa in sicurezza + chiusura segnalazione ordinaria
@@ -424,6 +488,10 @@ router.post('/', requireRole('MAINTAINER', 'SUPER_ADMIN', 'ADMINISTRATOR'), asyn
             classificationModified,
             suspensionReason: suspension_reason || '',
             suspensionDays: outcome === 'SUSPENDED' ? Math.floor(Number(suspension_days)) : null,
+            materialExtensionDays:
+                outcome === 'SCHEDULED' || outcome === 'SUSPENDED'
+                    ? materialExtensionDays
+                    : null,
             scheduledDate: report.scheduled_resolution_date || null,
             notes: notes || '',
             operationId,
@@ -460,10 +528,12 @@ router.post('/', requireRole('MAINTAINER', 'SUPER_ADMIN', 'ADMINISTRATOR'), asyn
             reportId: String(report._id),
         };
 
+        const esitoLabel = mapEmailPlaceholderValue('esito', outcome || '') || outcome || '';
+
         await safeNotify(() =>
             notifyTownHallStaff(name, {
                 title: `Sopralluogo completato — ${numero_palo}`,
-                body: `Esito: ${outcome}${notes ? ` — ${notes}` : ''}`,
+                body: `Esito: ${esitoLabel}${notes ? ` — ${notes}` : ''}`,
                 type: 'INSPECTION_COMPLETED',
                 url: dashboardUrl,
                 meta: { ...plMeta, outcome },

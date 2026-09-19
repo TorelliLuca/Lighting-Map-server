@@ -8,6 +8,8 @@ const {
     buildLightPointDashboardUrl,
 } = require('../utils/notificationHelpers');
 const { sendConfiguredEmail } = require('../utils/mailEngine');
+const { getFaultLabelDisplay } = require('../utils/reportHelpers');
+const { mapEmailPlaceholderValue } = require('../utils/emailDisplayLabels');
 
 const router = express.Router();
 
@@ -63,6 +65,8 @@ router.post('/send-email-to-user/lightPointReported', async (req, res) => {
         lng,
     });
 
+    const reportLabel = getFaultLabelDisplay(report.fault_label, report.report_type);
+
     await sendConfiguredEmail('REPORT_CREATED', {
         townHallId: th._id,
         townHallName: req.body.name,
@@ -75,7 +79,7 @@ router.post('/send-email-to-user/lightPointReported', async (req, res) => {
             nome_comune: req.body.name,
             numero_palo: numeroPalo,
             indirizzo: req.body.light_point?.indirizzo || '',
-            corpo_segnalazione: report.report_type || '',
+            corpo_segnalazione: reportLabel,
             nota: report.description || '',
         },
     });
@@ -83,7 +87,7 @@ router.post('/send-email-to-user/lightPointReported', async (req, res) => {
     await safeNotify(() =>
         createNotifications(destinationIds, {
             title: `Segnalazione su punto ${numeroPalo}`,
-            body: `${report.report_type || 'Guasto'} — ${req.body.name}${report.description ? `: ${report.description}` : ''}`,
+            body: `${reportLabel} — ${req.body.name}${report.description ? `: ${report.description}` : ''}`,
             type: 'REPORT_CREATED',
             url: dashboardUrl,
             meta: {
@@ -124,6 +128,11 @@ router.post('/send-email-to-user/reportSolved', async (req, res) => {
         lng,
     });
 
+    const operationLabel = mapEmailPlaceholderValue(
+        'tipo_operazione',
+        operation.operation_type || ''
+    ) || 'Intervento';
+
     await sendConfiguredEmail('REPORT_SOLVED', {
         townHallId: th._id,
         townHallName: req.body.name,
@@ -144,7 +153,7 @@ router.post('/send-email-to-user/reportSolved', async (req, res) => {
     await safeNotify(() =>
         createNotifications(destinationIds, {
             title: `Operazione su punto ${numeroPalo}`,
-            body: `${operation.operation_type || 'Intervento'} — ${req.body.name}${operation.description ? `: ${operation.description}` : ''}`,
+            body: `${operationLabel} — ${req.body.name}${operation.description ? `: ${operation.description}` : ''}`,
             type: 'REPORT_SOLVED',
             url: dashboardUrl,
             meta: {

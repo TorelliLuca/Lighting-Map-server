@@ -3,11 +3,12 @@
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js",
-    "dev": "cross-env NODE_ENV=development nodemon index.js",
-    "backup": "node scripts/backup.js"
-  },
+    "scripts": {
+      "start": "node index.js",
+      "dev": "cross-env NODE_ENV=development nodemon index.js",
+      "backup": "node scripts/backup.js",
+      "migrate:contracts": "cross-env NODE_ENV=development node scripts/migrate-contracts-to-linkedOrganizations.js"
+    },
   "keywords": [],
   "author": "",
   "license": "ISC",

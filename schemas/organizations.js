@@ -21,19 +21,13 @@ const organizationsSchema = new Schema({
         state: { type: String }
     },
     responsible: { type: Schema.Types.ObjectId, ref: 'users' },
-    townhallId: { type: Schema.Types.ObjectId, ref: 'townHalls' }, // Solo per 'TOWNHALL'
+    /** Solo per type TOWNHALL: legame org piattaforma ↔ comune (`organization_admin`). */
+    townhallId: { type: Schema.Types.ObjectId, ref: 'townHalls' },
     /**
-     * @deprecated Il legame manutentore↔comune vive sul capitolato
+     * Il legame manutentore↔comune vive esclusivamente sul capitolato
      * (`maintenanceConfig.linkedOrganizations` con budget O/S).
-     * Mantenuto solo per lettura/migrazione legacy.
+     * Campo rimosso: migrare con `scripts/migrate-contracts-to-linkedOrganizations.js`.
      */
-    contracts: [{
-        townhall_associated: { type: Schema.Types.ObjectId, ref: 'townHalls' },
-        start_date: { type: Date },
-        end_date: { type: Date },
-        details: { type: String },
-        price: { type: Number }
-    }]
 });
 
 module.exports = mongoose.model('Organizations', organizationsSchema);

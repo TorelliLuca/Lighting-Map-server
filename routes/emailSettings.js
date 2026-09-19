@@ -31,11 +31,12 @@ const SAMPLE_VARS = {
     nome_comune: 'Comune Esempio',
     numero_palo: '42',
     indirizzo: 'Via Roma 1',
-    corpo_segnalazione: 'Punto luce spento',
+    // Codici DB: renderTemplate li mappa alle etichette italiane
+    corpo_segnalazione: 'SINGLE_OFF',
     nota: 'Nota di esempio',
-    tipo_operazione: 'Sostituzione lampada',
+    tipo_operazione: 'FAULT_ELIMINATED_AND_SYSTEM_RESTORED',
     dettaglio: 'Dettaglio operazione',
-    esito: 'ORDINARY',
+    esito: 'RESOLVED',
     numero_preventivo: 'IMS-2026-001',
     totale: '1234.56',
     stato: 'PENDING_APPROVAL',
@@ -92,11 +93,115 @@ router.get('/newsletter/logs', async (_req, res) => {
         const logs = await NewsletterLog.find()
             .sort({ createdAt: -1 })
             .limit(50)
+            .select('-results')
             .populate('senderId', 'name surname email')
             .lean();
-        return res.json(logs);
+
+        const enriched = logs.map((log) => {
+            const attempted = Array.isArray(log.userIds) && log.userIds.length > 0
+                ? log.userIds.length
+                : (log.recipientCount || 0);
+            const sent = typeof log.sentCount === 'number'
+                ? log.sentCount
+                : (log.status === 'FAILED' ? 0 : (log.recipientCount || 0));
+            const failed = typeof log.failedCount === 'number'
+                ? log.failedCount
+                : Math.max(0, attempted - sent);
+            return {
+                ...log,
+                attemptedCount: attempted,
+                sentCount: sent,
+                failedCount: failed,
+            };
+        });
+
+        return res.json(enriched);
     } catch (error) {
         console.error('GET newsletter logs:', error);
+        return res.status(500).json({ error: 'Errore del server' });
+    }
+});
+
+// GET /api/email-settings/newsletter/logs/:id — dettaglio con destinatari
+router.get('/newsletter/logs/:id', async (req, res) => {
+    try {
+        if (!req.params.id || !/^[a-fA-F0-9]{24}$/.test(req.params.id)) {
+            return res.status(400).json({ error: 'ID log non valido' });
+        }
+
+        const log = await NewsletterLog.findById(req.params.id)
+            .populate('senderId', 'name surname email')
+            .lean();
+
+        if (!log) {
+            return res.status(404).json({ error: 'Log newsletter non trovato' });
+        }
+
+        const hasPerRecipient = Array.isArray(log.results) && log.results.length > 0;
+        let recipients = [];
+
+        if (hasPerRecipient) {
+            recipients = log.results.map((r) => ({
+                userId: r.userId || null,
+                email: r.email || '',
+                name: r.name || '',
+                surname: r.surname || '',
+                status: r.status,
+                error: r.error || null,
+            }));
+        } else {
+            const userDocs = await users
+                .find({ _id: { $in: log.userIds || [] } })
+                .select('_id email name surname')
+                .lean();
+            const byId = new Map(userDocs.map((u) => [String(u._id), u]));
+
+            // Log legacy: esito individuale solo se SUCCESS o FAILED globali
+            const inferredStatus = log.status === 'SUCCESS'
+                ? 'SENT'
+                : log.status === 'FAILED'
+                    ? 'FAILED'
+                    : 'UNKNOWN';
+
+            recipients = (log.userIds || []).map((id) => {
+                const u = byId.get(String(id));
+                return {
+                    userId: id,
+                    email: u?.email || '',
+                    name: u?.name || '',
+                    surname: u?.surname || '',
+                    status: inferredStatus,
+                    error: inferredStatus === 'FAILED' ? (log.errorMessage || null) : null,
+                };
+            });
+        }
+
+        const attempted = recipients.length > 0
+            ? recipients.length
+            : (log.recipientCount || 0);
+        const sent = typeof log.sentCount === 'number'
+            ? log.sentCount
+            : hasPerRecipient
+                ? recipients.filter((r) => r.status === 'SENT').length
+                : (log.status === 'FAILED' ? 0 : (log.recipientCount || 0));
+        const failed = typeof log.failedCount === 'number'
+            ? log.failedCount
+            : hasPerRecipient
+                ? recipients.filter((r) => r.status === 'FAILED').length
+                : Math.max(0, attempted - sent);
+
+        const { results: _results, ...rest } = log;
+
+        return res.json({
+            ...rest,
+            attemptedCount: attempted,
+            sentCount: sent,
+            failedCount: failed,
+            hasPerRecipientResults: hasPerRecipient,
+            recipients,
+        });
+    } catch (error) {
+        console.error('GET newsletter log detail:', error);
         return res.status(500).json({ error: 'Errore del server' });
     }
 });
@@ -402,9 +507,12 @@ router.post('/newsletter', newsletterLimiter, async (req, res) => {
         const log = await NewsletterLog.create({
             subject,
             senderId: req.currentUser._id,
-            recipientCount: result.sent,
+            recipientCount: recipients.length,
+            sentCount: result.sent,
+            failedCount: result.errors.length,
             filters: filters || { userIds },
             userIds: recipients.map((r) => r._id).filter(Boolean),
+            results: result.results,
             status,
             errorMessage: result.errors.length ? result.errors.slice(0, 5).join('; ') : null,
         });

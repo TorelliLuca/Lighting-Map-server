@@ -15,9 +15,11 @@ const {
     assertFaultLabelForMarker,
 } = require('../utils/reportHelpers');
 const { appendStatusHistory } = require('../utils/statusHistory');
+const { findActiveConfig, computeCapitolatoDueDate } = require('../utils/maintenanceConfigHelpers');
 const router = express.Router();
 
 const ADMIN_ROLES = new Set(['ADMINISTRATOR', 'SUPER_ADMIN']);
+const PRE_SURVEY_STATUSES = new Set(['OPEN', 'CLASSIFICATION_PENDING']);
 
 router.post('/addReport', async (req, res) => {
     try {
@@ -59,12 +61,13 @@ router.post('/addReport', async (req, res) => {
         }
 
         const plantContext = await resolvePlantContext(puntoLuce, townHall);
+        const reportDate = req.body.date ? new Date(req.body.date) : new Date();
 
         const reportPayload = {
             operation_point_id: puntoLuce._id,
             report_type: reportType,
             description: req.body.description || '',
-            report_date: req.body.date || new Date(),
+            report_date: reportDate,
             user_creator_id: req.body.user_creator_id || creator?._id,
             maintenance_category: req.body.maintenance_category || 'ORDINARY',
             fault_label: faultLabel,
@@ -73,6 +76,7 @@ router.post('/addReport', async (req, res) => {
             town_hall_id: townHall._id,
         };
 
+        let timerNote = null;
         if (isAdminReport && faultLabel && riskClass) {
             reportPayload.workflow_status = 'CLASSIFICATION_PENDING';
             reportPayload.classification = {
@@ -80,6 +84,15 @@ router.post('/addReport', async (req, res) => {
                 proposedBy: creator._id,
                 proposedAt: new Date(),
             };
+
+            // Timer sopralluogo: giorni materiale + opera del capitolato attivo per la classe
+            const config = await findActiveConfig(townHall._id);
+            const due = computeCapitolatoDueDate(config, riskClass, reportDate);
+            if (!due.ok) {
+                return res.status(400).json({ error: due.error });
+            }
+            reportPayload.due_date = due.dueDate;
+            timerNote = `Timer sopralluogo avviato — classe ${due.code}, ${due.leadDays} giorni (${due.materialDays} materiale + ${due.workDays} opera, capitolato)`;
         } else {
             reportPayload.workflow_status = 'OPEN';
         }
@@ -88,9 +101,10 @@ router.post('/addReport', async (req, res) => {
         appendStatusHistory(nuovaSegnalazione, {
             status: nuovaSegnalazione.workflow_status,
             by: creator?._id,
-            note: isAdminReport && faultLabel && riskClass
-                ? 'Classificazione provvisoria admin'
-                : 'Segnalazione aperta',
+            note: timerNote
+                || (isAdminReport && faultLabel && riskClass
+                    ? 'Classificazione provvisoria admin'
+                    : 'Segnalazione aperta'),
         });
 
         puntoLuce.segnalazioni_in_corso.push(nuovaSegnalazione);
@@ -420,6 +434,31 @@ router.patch('/api/reports/:id/classification', requireRole('MAINTAINER', 'SUPER
         if (modified) {
             report.classification.previousRiskClass = previousRisk;
             report.classification.previousFaultLabel = previousFault;
+        }
+
+        // Se ancora in attesa di sopralluogo e la classe cambia, ricalcola il timer capitolato
+        if (
+            PRE_SURVEY_STATUSES.has(report.workflow_status || 'OPEN')
+            && report.risk_class
+            && risk_class
+            && risk_class !== previousRisk
+            && report.town_hall_id
+        ) {
+            const config = await findActiveConfig(report.town_hall_id);
+            const due = computeCapitolatoDueDate(
+                config,
+                report.risk_class,
+                report.report_date || new Date()
+            );
+            if (!due.ok) {
+                return res.status(400).json({ error: due.error });
+            }
+            report.due_date = due.dueDate;
+            appendStatusHistory(report, {
+                status: report.workflow_status,
+                by: userId,
+                note: `Timer sopralluogo aggiornato — classe ${due.code}, ${due.leadDays} giorni capitolato`,
+            });
         }
 
         if (report.workflow_status === 'CLASSIFICATION_PENDING') {

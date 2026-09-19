@@ -15,6 +15,7 @@ const schema = new Schema({
     classificationModified: { type: Boolean, default: false },
     suspensionReason: { type: String, default: "" },
     suspensionDays: { type: Number, default: null, min: 1 },
+    materialExtensionDays: { type: Number, default: null, min: 0 },
     scheduledDate: { type: Date, default: null },
     notes: { type: String, default: "" },
     operationId: { type: Schema.Types.ObjectId, ref: "operations", default: null },

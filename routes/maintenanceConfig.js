@@ -459,57 +459,23 @@ router.post('/config/:configId/import-csv', requireRole(...CONFIG_EDITOR_ROLES),
 
         const { materials, skippedRows } = parsePrezziarioCsv(csv);
 
-        // Legacy: se il comune ha un prezziario regionale collegato, importa lì.
-        if (config.regionalPriceListId) {
-            const RegionalPriceList = require('../schemas/regionalPriceList');
-            const list = await RegionalPriceList.findById(config.regionalPriceListId);
-            if (!list) {
-                return res.status(404).json({ error: 'Prezziario regionale collegato non trovato' });
-            }
-            const imported = materials.map((item) => ({
-                code: item.code,
-                description: item.description,
-                fullDescription: item.fullDescription || '',
-                udm: normalizeUdm(item.udm),
-                unitPrice: item.unitPrice,
-                category: item.category || '',
-            }));
-            if (merge === true) {
-                const byCode = new Map((list.materials || []).map((m) => [m.code, {
-                    code: m.code,
-                    description: m.description,
-                    fullDescription: m.fullDescription || '',
-                    udm: normalizeUdm(m.udm),
-                    unitPrice: m.unitPrice,
-                    category: m.category,
-                }]));
-                for (const material of imported) byCode.set(material.code, material);
-                list.materials = [...byCode.values()];
-            } else {
-                list.materials = imported;
-            }
-            list.categories = mergeMaterialCategories(list.categories, list.materials, DEFAULT_MATERIAL_CATEGORIES);
-            list.updatedBy = req.currentUser._id;
-            list.markModified('materials');
-            list.markModified('categories');
-            await list.save();
-        } else {
-            config.materialCatalog = mergeCatalogByPriceType(
-                config.materialCatalog,
-                materials,
-                'regional',
-                merge === true
-            );
-            config.materialCategories = mergeMaterialCategories(
-                config.materialCategories,
-                materials,
-                DEFAULT_MATERIAL_CATEGORIES
-            );
-            config.updatedBy = req.currentUser._id;
-            config.markModified('materialCatalog');
-            config.markModified('materialCategories');
-            await config.save();
-        }
+        // Import generico capitolato: sostituisce/unisce solo le voci priceType=capitolato
+        // (stesso perimetro del vecchio import-bra). Il prezzario regionale ha endpoint dedicato.
+        config.materialCatalog = mergeCatalogByPriceType(
+            config.materialCatalog,
+            materials,
+            'capitolato',
+            merge === true
+        );
+        config.materialCategories = mergeMaterialCategories(
+            config.materialCategories,
+            materials,
+            DEFAULT_MATERIAL_CATEGORIES
+        );
+        config.updatedBy = req.currentUser._id;
+        config.markModified('materialCatalog');
+        config.markModified('materialCategories');
+        await config.save();
 
         const townHall = await townHalls.findById(config.townHallId).select('_id name');
         const fresh = await MaintenanceConfig.findById(config._id);
@@ -989,7 +955,7 @@ router.post('/:townHallId/import-csv', requireRole(...CONFIG_EDITOR_ROLES), asyn
         config.materialCatalog = mergeCatalogByPriceType(
             config.materialCatalog,
             materials,
-            'regional',
+            'capitolato',
             merge === true
         );
         config.materialCategories = mergeMaterialCategories(

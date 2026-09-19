@@ -109,6 +109,139 @@ async function findActiveConfig(townHallId) {
     return MaintenanceConfig.findOne({ townHallId, status: 'active' });
 }
 
+/**
+ * Giorni di lead time capitolato per classe di rischio (materiale + opera).
+ * Usato per scadenza sopralluogo alla segnalazione admin e per risoluzione programmata.
+ */
+function resolveRiskClassLead(config, riskCode) {
+    const code = ['A', 'B', 'C', 'D'].includes(riskCode) ? riskCode : 'C';
+    const riskCfg = (config?.riskClasses || []).find((r) => r.code === code);
+    const materialDays = Number(riskCfg?.defaultMaterialDays) || 0;
+    const workDays = Number(riskCfg?.defaultWorkDays) || 0;
+    const leadDays = materialDays + workDays;
+    return { code, riskCfg, materialDays, workDays, leadDays };
+}
+
+/**
+ * Calcola la data di scadenza (mezzanotte locale) da capitolato + classe rischio.
+ * @returns {{ ok: true, dueDate: Date, code, materialDays, workDays, leadDays }
+ *   | { ok: false, error: string, code, materialDays, workDays, leadDays }}
+ */
+function computeCapitolatoDueDate(config, riskCode, fromDate = new Date()) {
+    const resolved = resolveRiskClassLead(config, riskCode);
+    if (resolved.leadDays < 1) {
+        return {
+            ok: false,
+            error: `Termini capitolato non configurati per la classe ${resolved.code}`,
+            ...resolved,
+        };
+    }
+    const base = fromDate instanceof Date ? new Date(fromDate) : new Date(fromDate || Date.now());
+    if (Number.isNaN(base.getTime())) {
+        return {
+            ok: false,
+            error: 'Data di partenza non valida per il calcolo della scadenza',
+            ...resolved,
+        };
+    }
+    const dueDate = new Date(base);
+    dueDate.setHours(0, 0, 0, 0);
+    dueDate.setDate(dueDate.getDate() + resolved.leadDays);
+    return { ok: true, dueDate, ...resolved };
+}
+
+function startOfLocalDay(date) {
+    const d = date instanceof Date ? new Date(date) : new Date(date);
+    if (Number.isNaN(d.getTime())) return null;
+    d.setHours(0, 0, 0, 0);
+    return d;
+}
+
+function addCalendarDays(date, days) {
+    const d = startOfLocalDay(date);
+    if (!d) return null;
+    d.setDate(d.getDate() + (Number(days) || 0));
+    return d;
+}
+
+function calendarDaysElapsed(fromDate, toDate = new Date()) {
+    const from = startOfLocalDay(fromDate);
+    const to = startOfLocalDay(toDate);
+    if (!from || !to) return 0;
+    return Math.max(0, Math.floor((to.getTime() - from.getTime()) / (24 * 60 * 60 * 1000)));
+}
+
+/**
+ * Scadenza risoluzione programmata all'esito SCHEDULED del sopralluogo.
+ *
+ * - stessa classe e nessuna estensione → tiene la due_date della segnalazione
+ * - cambio classe → data_segnalazione + lead(nuova)  (sconta i giorni già trascorsi)
+ * - estensione materiali → si somma ai giorni della base sopra
+ * - senza due_date pregressa → oggi + lead(classe confermata)
+ */
+function computeScheduledResolutionAtSurvey({
+    config,
+    reportDate,
+    originalDueDate,
+    originalRiskClass,
+    confirmedRiskClass,
+    extensionDays = 0,
+    surveyDate = new Date(),
+} = {}) {
+    const confirmed = resolveRiskClassLead(config, confirmedRiskClass);
+    if (confirmed.leadDays < 1) {
+        return {
+            ok: false,
+            error: `Termini capitolato non configurati per la classe ${confirmed.code}`,
+            ...confirmed,
+        };
+    }
+
+    const ext = Math.max(0, Math.floor(Number(extensionDays) || 0));
+    const originalCode = ['A', 'B', 'C', 'D'].includes(originalRiskClass) ? originalRiskClass : null;
+    const classChanged = Boolean(originalCode && originalCode !== confirmed.code);
+    const originalDue = originalDueDate ? startOfLocalDay(originalDueDate) : null;
+    const hasOriginalDue = Boolean(originalDue);
+    const elapsedDays = calendarDaysElapsed(reportDate || surveyDate, surveyDate);
+
+    let baseDue = null;
+    let mode = 'FRESH_FROM_SURVEY';
+
+    if (!classChanged && hasOriginalDue) {
+        baseDue = originalDue;
+        mode = 'KEEP_ORIGINAL';
+    } else if (classChanged) {
+        // Cambio classe: lead(nuova) ancorato alla data segnalazione (sconta i trascorsi)
+        const fromReport = computeCapitolatoDueDate(
+            config,
+            confirmed.code,
+            reportDate || surveyDate
+        );
+        if (!fromReport.ok) return fromReport;
+        baseDue = fromReport.dueDate;
+        mode = 'CLASS_ADJUSTED';
+    } else {
+        const fromSurvey = computeCapitolatoDueDate(config, confirmed.code, surveyDate);
+        if (!fromSurvey.ok) return fromSurvey;
+        baseDue = fromSurvey.dueDate;
+        mode = 'FRESH_FROM_SURVEY';
+    }
+
+    const dueDate = ext > 0 ? addCalendarDays(baseDue, ext) : baseDue;
+
+    return {
+        ok: true,
+        dueDate,
+        baseDue,
+        extensionDays: ext,
+        mode,
+        classChanged,
+        elapsedDays,
+        originalRiskClass: originalCode,
+        ...confirmed,
+    };
+}
+
 async function getOrCreateActiveConfig(townHallId, userId) {
     await ensureLegacyMigration();
 
@@ -524,6 +657,12 @@ module.exports = {
     ensureLegacyMigration,
     buildValidityMeta,
     findActiveConfig,
+    resolveRiskClassLead,
+    computeCapitolatoDueDate,
+    startOfLocalDay,
+    addCalendarDays,
+    calendarDaysElapsed,
+    computeScheduledResolutionAtSurvey,
     getOrCreateActiveConfig,
     cloneConfigFields,
     cloneLinkedOrganizations,

@@ -70,8 +70,8 @@ Hook post-delete:
 - `location: { type: 'Point', coordinates: [lng, lat] }`
 - `address: { street, city, province, postal_code, state }`
 - `responsible: ObjectId (ref: users)`
-- `townhallId: ObjectId (ref: townHalls)`
-- `contracts: [{ townhall_associated: ObjectId (ref: townHalls), start_date, end_date, details, price }]`
+- `townhallId: ObjectId (ref: townHalls)` — solo per type `TOWNHALL` (`organization_admin`)
+- Il legame impresa↔comune (budget O/S) è su `maintenanceConfig.linkedOrganizations`, non sull'organizzazione.
 
 ## borders (`schemas/borders.js`)
 - Feature GeoJSON con `properties` (nome comune, codici ISTAT, ecc.) e `geometry` (Polygon), con indice geospaziale `2dsphere`.

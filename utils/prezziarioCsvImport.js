@@ -88,7 +88,7 @@ function rowToMaterial(row, headerMap) {
         unitPrice,
         category: category || 'GENERALE',
         isStandard: true,
-        priceType: 'regional',
+        priceType: 'capitolato',
         addedBy: '',
     };
 }
